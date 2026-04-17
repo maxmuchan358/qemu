@@ -35,6 +35,8 @@
 #include "hw/acpi/aml-build.h"
 #include "hw/acpi/generic_event_device.h"
 #include "hw/acpi/ghes.h"
+#include "hw/audio/pcspk.h"
+#include "hw/i386/pc.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/topology.h"
 
@@ -156,7 +158,15 @@ static const CPUArchIdList *x86_possible_cpu_arch_ids(MachineState *ms)
 static void x86_nmi(NMIState *n, int cpu_index, Error **errp)
 {
     /* cpu index isn't used */
+    MachineState *ms = MACHINE(qdev_get_machine());
     CPUState *cs;
+
+    if (object_dynamic_cast(OBJECT(ms), TYPE_PC_MACHINE)) {
+        PCMachineState *pcms = PC_MACHINE(ms);
+        X86MachineState *x86ms = X86_MACHINE(ms);
+
+        pcspk_set_nmi_status(pcms->pcspk, x86ms->nmi_source);
+    }
 
     CPU_FOREACH(cs) {
         X86CPU *cpu = X86_CPU(cs);
@@ -471,6 +481,27 @@ static void x86_machine_set_bus_lock_ratelimit(Object *obj, Visitor *v,
     visit_type_uint64(v, name, &x86ms->bus_lock_ratelimit, errp);
 }
 
+static void x86_machine_get_nmi_source(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+    uint8_t nmi_source = x86ms->nmi_source;
+
+    visit_type_uint8(v, name, &nmi_source, errp);
+}
+
+static void x86_machine_set_nmi_source(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+    uint8_t nmi_source = 0;
+
+    visit_type_uint8(v, name, &nmi_source, errp);
+    x86ms->nmi_source = nmi_source & (PCSPK_NMI_IOCHK | PCSPK_NMI_SERR);
+}
+
 static void machine_get_sgx_epc(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
@@ -514,6 +545,7 @@ static void x86_machine_initfn(Object *obj)
     x86ms->oem_id = g_strndup(ACPI_BUILD_APPNAME6, 6);
     x86ms->oem_table_id = g_strndup(ACPI_BUILD_APPNAME8, 8);
     x86ms->bus_lock_ratelimit = 0;
+    x86ms->nmi_source = 0;
     x86ms->above_4g_mem_start = 4 * GiB;
 }
 
@@ -576,6 +608,13 @@ static void x86_machine_class_init(ObjectClass *oc, const void *data)
                                 x86_machine_set_bus_lock_ratelimit, NULL, NULL);
     object_class_property_set_description(oc, X86_MACHINE_BUS_LOCK_RATELIMIT,
             "Set the ratelimit for the bus locks acquired in VMs");
+
+    object_class_property_add(oc, X86_MACHINE_NMI_SOURCE, "uint8",
+                              x86_machine_get_nmi_source,
+                              x86_machine_set_nmi_source,
+                              NULL, NULL);
+    object_class_property_set_description(oc, X86_MACHINE_NMI_SOURCE,
+            "Set the x86 NMI source latch: 0=unknown, 64=IOCHK, 128=SERR");
 
     object_class_property_add(oc, "sgx-epc", "SgxEPC",
         machine_get_sgx_epc, machine_set_sgx_epc,
