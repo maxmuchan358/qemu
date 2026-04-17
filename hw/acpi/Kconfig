@@ -11,6 +11,7 @@ config ACPI_X86
     select ACPI_HMAT
     select ACPI_PCIHP
     select ACPI_ERST
+    select ACPI_APEI
 
 config ACPI_ICH9
     bool

@@ -192,6 +192,7 @@ static void pc_q35_init(MachineState *machine)
 
     pc_machine_init_sgx_epc(pcms);
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
+    x86_ghes_init(x86ms);
 
     if (kvm_enabled()) {
         kvmclock_create(pcmc->kvmclock_create_always);
@@ -232,6 +233,7 @@ static void pc_q35_init(MachineState *machine)
 
     /* irq lines */
     gsi_state = pc_gsi_create(&x86ms->gsi, true);
+    x86_ghes_gsi_init(x86ms);
 
     /* create ISA bus */
     lpc = pci_new_multifunction(PCI_DEVFN(ICH9_LPC_DEV, ICH9_LPC_FUNC),

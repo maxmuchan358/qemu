@@ -73,6 +73,9 @@ typedef struct AcpiNotificationSourceId {
     enum AcpiGhesNotifyType notify;
 } AcpiNotificationSourceId;
 
+#define ACPI_GHES_EINJ_IO_BASE  0x0B00
+#define ACPI_GHES_EINJ_IO_SIZE  0x08
+
 /*
  * AcpiGhesState stores GPA values that will be used to fill HEST entries.
  *
@@ -87,6 +90,7 @@ typedef struct AcpiNotificationSourceId {
 typedef struct AcpiGhesState {
     uint64_t hest_addr_le;
     uint64_t hw_error_le;
+    uint64_t einj_param_le;
     bool use_hest_addr; /* True if HEST address is present */
 } AcpiGhesState;
 
@@ -96,10 +100,19 @@ void acpi_build_hest(AcpiGhesState *ags, GArray *table_data,
                      const AcpiNotificationSourceId * const notif_source,
                      int num_sources,
                      const char *oem_id, const char *oem_table_id);
+void acpi_build_einj(AcpiGhesState *ags, GArray *table_data,
+                     GArray *hardware_errors,
+                     BIOSLinker *linker,
+                     const char *oem_id, const char *oem_table_id);
 void acpi_ghes_add_fw_cfg(AcpiGhesState *vms, FWCfgState *s,
                           GArray *hardware_errors);
 bool acpi_ghes_memory_errors(AcpiGhesState *ags, uint16_t source_id,
                             uint64_t error_physical_addr, Error **errp);
+bool acpi_ghes_memory_errors_with_severity(AcpiGhesState *ags,
+                                           uint16_t source_id,
+                                           uint64_t error_physical_addr,
+                                           uint32_t error_severity,
+                                           Error **errp);
 bool ghes_record_cper_errors(AcpiGhesState *ags, const void *cper, size_t len,
                              uint16_t source_id, Error **errp);
 

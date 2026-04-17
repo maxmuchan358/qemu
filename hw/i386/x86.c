@@ -31,11 +31,17 @@
 #include "system/numa.h"
 #include "trace.h"
 
+#include "hw/acpi/acpi.h"
 #include "hw/acpi/aml-build.h"
+#include "hw/acpi/generic_event_device.h"
+#include "hw/acpi/ghes.h"
 #include "hw/i386/x86.h"
 #include "hw/i386/topology.h"
 
 #include "hw/core/nmi.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "system/address-spaces.h"
 #include "kvm/kvm_i386.h"
 
 
@@ -161,6 +167,145 @@ static void x86_nmi(NMIState *n, int cpu_index, Error **errp)
             cpu_interrupt(cs, CPU_INTERRUPT_NMI);
         }
     }
+}
+
+static void x86_generic_error_req(Notifier *n, void *opaque)
+{
+    X86MachineState *x86ms = container_of(n, X86MachineState,
+                                          generic_error_notifier);
+    uint16_t *source_id = opaque;
+
+    switch (*source_id) {
+    case ACPI_HEST_SRC_ID_SYNC:
+        if (x86ms->ghes_dev) {
+            acpi_send_event(x86ms->ghes_dev, ACPI_GENERIC_ERROR);
+        }
+        break;
+    case ACPI_HEST_SRC_ID_QMP:
+        nmi_monitor_handle(0, NULL);
+        break;
+    default:
+        break;
+    }
+}
+
+#define ACPI_EINJ_MEMORY_CORRECTABLE    (1U << 3)
+#define ACPI_EINJ_MEMORY_UNCORRECTABLE  (1U << 4)
+#define ACPI_EINJ_MEMORY_FATAL          (1U << 5)
+
+typedef struct AcpiEinjSetErrorTypeWithAddress {
+    uint32_t type;
+    uint32_t vendor_extension;
+    uint32_t flags;
+    uint32_t apicid;
+    uint64_t memory_address;
+    uint64_t memory_address_range;
+    uint32_t pcie_sbdf;
+    uint32_t reserved;
+} QEMU_PACKED AcpiEinjSetErrorTypeWithAddress;
+
+static void x86_einj_inject(X86MachineState *x86ms)
+{
+    AcpiGhesState *ags = acpi_ghes_get_state();
+    AcpiEinjSetErrorTypeWithAddress params = { 0 };
+    uint64_t phys_addr;
+    uint32_t sev;
+    Error *local_err = NULL;
+
+    if (!ags || !ags->einj_param_le) {
+        error_report("EINJ trigger requested without an active parameter block");
+        return;
+    }
+
+    cpu_physical_memory_read(le64_to_cpu(ags->einj_param_le),
+                             &params, sizeof(params));
+
+    phys_addr = params.memory_address ? params.memory_address : 0x12345000;
+
+    if (params.type & ACPI_EINJ_MEMORY_FATAL) {
+        sev = 1;
+    } else if (params.type & ACPI_EINJ_MEMORY_CORRECTABLE) {
+        sev = 2;
+    } else if (params.type & ACPI_EINJ_MEMORY_UNCORRECTABLE) {
+        sev = 0;
+    } else {
+        error_report("EINJ unsupported error type 0x%x", params.type);
+        return;
+    }
+
+    if (!acpi_ghes_memory_errors_with_severity(ags, ACPI_HEST_SRC_ID_SYNC,
+                                               phys_addr, sev,
+                                               &local_err)) {
+        error_report_err(local_err);
+    }
+}
+
+static uint64_t x86_einj_read(void *opaque, hwaddr addr, unsigned size)
+{
+    (void)opaque;
+    (void)addr;
+    (void)size;
+    return 0;
+}
+
+static void x86_einj_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    X86MachineState *x86ms = opaque;
+
+    (void)size;
+    if (addr == 0 && (val & 1)) {
+        x86_einj_inject(x86ms);
+    }
+}
+
+static const MemoryRegionOps x86_einj_ops = {
+    .read = x86_einj_read,
+    .write = x86_einj_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+
+void x86_ghes_init(X86MachineState *x86ms)
+{
+    MachineState *machine = MACHINE(x86ms);
+    DeviceState *dev;
+
+    if (!x86_machine_is_acpi_enabled(x86ms) || x86ms->ghes_dev) {
+        return;
+    }
+
+    dev = qdev_new(TYPE_ACPI_GED);
+    qdev_prop_set_uint32(dev, "ged-event", ACPI_GED_ERROR_EVT);
+    object_property_add_child(OBJECT(machine), "ghes", OBJECT(dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+
+    x86ms->ghes_dev = dev;
+    x86ms->generic_error_notifier.notify = x86_generic_error_req;
+    notifier_list_add(&acpi_generic_error_notifiers,
+                      &x86ms->generic_error_notifier);
+
+    memory_region_init_io(&x86ms->einj_io, OBJECT(machine), &x86_einj_ops,
+                          x86ms, "x86-einj", ACPI_GHES_EINJ_IO_SIZE);
+    memory_region_add_subregion(get_system_io(), ACPI_GHES_EINJ_IO_BASE,
+                                &x86ms->einj_io);
+}
+
+void x86_ghes_gsi_init(X86MachineState *x86ms)
+{
+    SysBusDevice *sbdev;
+
+    if (!x86ms->ghes_dev || !x86ms->gsi) {
+        return;
+    }
+
+    sbdev = SYS_BUS_DEVICE(x86ms->ghes_dev);
+    sysbus_mmio_map(sbdev, 0, ACPI_GHES_GED_EVT_BASE);
+    sysbus_mmio_map(sbdev, 2, ACPI_GHES_GED_REGS_BASE);
+    sysbus_connect_irq(sbdev, 0, x86ms->gsi[ACPI_GHES_GED_IRQ]);
 }
 
 bool x86_machine_is_smm_enabled(const X86MachineState *x86ms)

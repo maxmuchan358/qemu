@@ -25,6 +25,7 @@ void qmp_inject_ghes_v2_error(const char *qmp_cper, Error **errp)
 
     ags = acpi_ghes_get_state();
     if (!ags) {
+        error_setg(errp, "GHES is not active on this machine");
         return;
     }
 

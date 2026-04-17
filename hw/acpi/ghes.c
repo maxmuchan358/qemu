@@ -32,6 +32,7 @@
 #define ACPI_HW_ERROR_FW_CFG_FILE           "etc/hardware_errors"
 #define ACPI_HW_ERROR_ADDR_FW_CFG_FILE      "etc/hardware_errors_addr"
 #define ACPI_HEST_ADDR_FW_CFG_FILE          "etc/acpi_table_hest_addr"
+#define ACPI_EINJ_PARAM_ADDR_FW_CFG_FILE    "etc/einj_param_addr"
 
 /* The max size in bytes for one error block */
 #define ACPI_GHES_MAX_RAW_DATA_LENGTH   (1 * KiB)
@@ -101,7 +102,23 @@ enum AcpiGenericErrorSeverity {
     ACPI_CPER_SEV_CORRECTED = 2,
     ACPI_CPER_SEV_NONE = 3,
 };
+typedef struct AcpiEinjSetErrorTypeWithAddress {
+    uint32_t type;
+    uint32_t vendor_extension;
+    uint32_t flags;
+    uint32_t apicid;
+    uint64_t memory_address;
+    uint64_t memory_address_range;
+    uint32_t pcie_sbdf;
+    uint32_t reserved;
+} QEMU_PACKED AcpiEinjSetErrorTypeWithAddress;
 
+typedef struct AcpiEinjTrigger {
+    uint32_t header_size;
+    uint32_t revision;
+    uint32_t table_size;
+    uint32_t entry_count;
+} QEMU_PACKED AcpiEinjTrigger;
 /*
  * Hardware Error Notification
  * ACPI 4.0: 17.3.2.7 Hardware Error Notification
@@ -213,23 +230,27 @@ static void acpi_ghes_build_append_mem_cper(GArray *table,
     build_append_int_noprefix(table, 0, 7);
 }
 
-static void
-ghes_gen_err_data_uncorrectable_recoverable(GArray *block,
-                                            const uint8_t *section_type,
-                                            int data_length)
+static void ghes_gen_err_data_memory_error(GArray *block,
+                                           const uint8_t *section_type,
+                                           int data_length,
+                                           uint32_t error_severity)
 {
+    uint32_t block_status;
     /* invalid fru id: ACPI 4.0: 17.3.2.6.1 Generic Error Data,
      * Table 17-13 Generic Error Data Entry
      */
     QemuUUID fru_id = {};
 
+    block_status = (error_severity == ACPI_CPER_SEV_CORRECTED) ? 0x2 :
+                   ACPI_GEBS_UNCORRECTABLE;
+
     /* Build the new generic error status block header */
-    acpi_ghes_generic_error_status(block, ACPI_GEBS_UNCORRECTABLE,
-        0, 0, data_length, ACPI_CPER_SEV_RECOVERABLE);
+    acpi_ghes_generic_error_status(block, block_status,
+        0, 0, data_length, error_severity);
 
     /* Build this new generic error data entry header */
     acpi_ghes_generic_error_data(block, section_type,
-        ACPI_CPER_SEV_RECOVERABLE, 0, 0,
+        error_severity, 0, 0,
         ACPI_GHES_MEM_CPER_LENGTH, fru_id, 0);
 }
 
@@ -405,6 +426,123 @@ void acpi_build_hest(AcpiGhesState *ags, GArray *table_data,
     }
 }
 
+static void build_einj_instruction(GArray *table_data,
+                                   BIOSLinker *linker,
+                                   uint8_t action,
+                                   uint8_t instruction,
+                                   uint8_t flags,
+                                   uint8_t space_id,
+                                   uint8_t bit_width,
+                                   uint8_t access_size,
+                                   int hw_error_offset,
+                                   uint64_t gas_address,
+                                   uint64_t value,
+                                   uint64_t mask)
+{
+    uint32_t address_offset;
+
+    build_append_int_noprefix(table_data, action, 1);
+    build_append_int_noprefix(table_data, instruction, 1);
+    build_append_int_noprefix(table_data, flags, 1);
+    build_append_int_noprefix(table_data, 0, 1);
+    address_offset = table_data->len;
+    build_append_gas(table_data, space_id, bit_width, 0, access_size,
+                     gas_address);
+    if (hw_error_offset >= 0) {
+        bios_linker_loader_add_pointer(linker, ACPI_BUILD_TABLE_FILE,
+                                       address_offset + GAS_ADDR_OFFSET,
+                                       sizeof(uint64_t),
+                                       ACPI_HW_ERROR_FW_CFG_FILE,
+                                       hw_error_offset);
+    }
+    build_append_int_noprefix(table_data, value, 8);
+    build_append_int_noprefix(table_data, mask, 8);
+}
+
+void acpi_build_einj(AcpiGhesState *ags, GArray *table_data,
+                     GArray *hardware_errors,
+                     BIOSLinker *linker,
+                     const char *oem_id, const char *oem_table_id)
+{
+    const uint32_t available_error_types = (1U << 3) | (1U << 4) | (1U << 5);
+
+    (void)ags;
+    AcpiEinjSetErrorTypeWithAddress param_block = { 0 };
+    AcpiEinjTrigger trigger = {
+        .header_size = sizeof(trigger),
+        .revision = 1,
+        .table_size = sizeof(trigger) + 32,
+        .entry_count = 1,
+    };
+    AcpiTable table = { .sig = "EINJ", .rev = 1,
+                        .oem_id = oem_id, .oem_table_id = oem_table_id };
+    uint32_t type_off, busy_off, cmd_status_off;
+    uint32_t trigger_addr_off, param_off, trigger_off;
+
+    type_off = hardware_errors->len;
+    build_append_int_noprefix(hardware_errors, available_error_types, 4);
+    build_append_int_noprefix(hardware_errors, 0, 4);
+
+    busy_off = hardware_errors->len;
+    build_append_int_noprefix(hardware_errors, 0, 8);
+
+    cmd_status_off = hardware_errors->len;
+    build_append_int_noprefix(hardware_errors, 0, 8);
+
+    trigger_addr_off = hardware_errors->len;
+    build_append_int_noprefix(hardware_errors, 0, 8);
+
+    param_off = hardware_errors->len;
+    g_array_append_vals(hardware_errors, &param_block, sizeof(param_block));
+
+    trigger_off = hardware_errors->len;
+    g_array_append_vals(hardware_errors, &trigger, sizeof(trigger));
+    build_einj_instruction(hardware_errors, linker, 0xFF, 0x03, 0,
+                           AML_AS_SYSTEM_IO, 8, 1, -1,
+                           ACPI_GHES_EINJ_IO_BASE, 1, 0xFF);
+
+    bios_linker_loader_add_pointer(linker, ACPI_HW_ERROR_FW_CFG_FILE,
+                                   trigger_addr_off, sizeof(uint64_t),
+                                   ACPI_HW_ERROR_FW_CFG_FILE, trigger_off);
+    bios_linker_loader_write_pointer(linker, ACPI_EINJ_PARAM_ADDR_FW_CFG_FILE,
+                                     0, sizeof(uint64_t),
+                                     ACPI_HW_ERROR_FW_CFG_FILE, param_off);
+
+    acpi_table_begin(&table, table_data);
+    build_append_int_noprefix(table_data, 12, 4);
+    build_append_int_noprefix(table_data, 0, 1);
+    build_append_int_noprefix(table_data, 0, 3);
+    build_append_int_noprefix(table_data, 9, 4);
+
+    build_einj_instruction(table_data, linker, 0x0, 0x4, 0,
+                           AML_AS_SYSTEM_MEMORY, 0, 0, -1, 0, 0, 0);
+    build_einj_instruction(table_data, linker, 0x1, 0x0, 0,
+                           AML_AS_SYSTEM_MEMORY, 64, 4, trigger_addr_off,
+                           0, 0, ~0ULL);
+    build_einj_instruction(table_data, linker, 0x2, 0x2, 0,
+                           AML_AS_SYSTEM_MEMORY, 32, 3, param_off,
+                           0, 0, ~0ULL);
+    build_einj_instruction(table_data, linker, 0x3, 0x0, 0,
+                           AML_AS_SYSTEM_MEMORY, 32, 3, type_off,
+                           0, 0, ~0ULL);
+    build_einj_instruction(table_data, linker, 0x4, 0x4, 0,
+                           AML_AS_SYSTEM_MEMORY, 0, 0, -1, 0, 0, 0);
+    build_einj_instruction(table_data, linker, 0x5, 0x03, 0,
+                           AML_AS_SYSTEM_IO, 8, 1, -1,
+                           ACPI_GHES_EINJ_IO_BASE, 1, 0xFF);
+    build_einj_instruction(table_data, linker, 0x6, 0x0, 0,
+                           AML_AS_SYSTEM_MEMORY, 64, 4, busy_off,
+                           0, 0, 1);
+    build_einj_instruction(table_data, linker, 0x7, 0x0, 0,
+                           AML_AS_SYSTEM_MEMORY, 64, 4, cmd_status_off,
+                           0, 0, ~0ULL);
+    build_einj_instruction(table_data, linker, 0x8, 0x2, 0,
+                           AML_AS_SYSTEM_MEMORY, 64, 4, param_off,
+                           0, 0, ~0ULL);
+
+    acpi_table_end(linker, &table);
+}
+
 void acpi_ghes_add_fw_cfg(AcpiGhesState *ags, FWCfgState *s,
                           GArray *hardware_error)
 {
@@ -420,6 +558,9 @@ void acpi_ghes_add_fw_cfg(AcpiGhesState *ags, FWCfgState *s,
         fw_cfg_add_file_callback(s, ACPI_HW_ERROR_ADDR_FW_CFG_FILE, NULL, NULL,
             NULL, &(ags->hw_error_le), sizeof(ags->hw_error_le), false);
     }
+
+    fw_cfg_add_file_callback(s, ACPI_EINJ_PARAM_ADDR_FW_CFG_FILE, NULL, NULL,
+        NULL, &(ags->einj_param_le), sizeof(ags->einj_param_le), false);
 }
 
 static void get_hw_error_offsets(uint64_t ghes_addr,
@@ -562,8 +703,11 @@ bool ghes_record_cper_errors(AcpiGhesState *ags, const void *cper, size_t len,
     return true;
 }
 
-bool acpi_ghes_memory_errors(AcpiGhesState *ags, uint16_t source_id,
-                             uint64_t physical_address, Error **errp)
+bool acpi_ghes_memory_errors_with_severity(AcpiGhesState *ags,
+                                           uint16_t source_id,
+                                           uint64_t physical_address,
+                                           uint32_t error_severity,
+                                           Error **errp)
 {
     /* Memory Error Section Type */
     const uint8_t guid[] =
@@ -580,13 +724,23 @@ bool acpi_ghes_memory_errors(AcpiGhesState *ags, uint16_t source_id,
     assert((data_length + ACPI_GHES_GESB_SIZE) <=
             ACPI_GHES_MAX_RAW_DATA_LENGTH);
 
-    ghes_gen_err_data_uncorrectable_recoverable(block, guid, data_length);
+    ghes_gen_err_data_memory_error(block, guid, data_length,
+                                   error_severity);
 
     /* Build the memory section CPER for above new generic error data entry */
     acpi_ghes_build_append_mem_cper(block, physical_address);
 
     return ghes_record_cper_errors(ags, block->data, block->len,
                                    source_id, errp);
+}
+
+bool acpi_ghes_memory_errors(AcpiGhesState *ags, uint16_t source_id,
+                             uint64_t physical_address, Error **errp)
+{
+    return acpi_ghes_memory_errors_with_severity(ags, source_id,
+                                                 physical_address,
+                                                 ACPI_CPER_SEV_RECOVERABLE,
+                                                 errp);
 }
 
 AcpiGhesState *acpi_ghes_get_state(void)

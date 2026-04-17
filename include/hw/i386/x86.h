@@ -25,6 +25,7 @@
 #include "hw/intc/ioapic.h"
 #include "hw/isa/isa.h"
 #include "qom/object.h"
+#include "qemu/notify.h"
 #include "system/igvm-cfg.h"
 
 struct X86MachineClass {
@@ -47,6 +48,9 @@ struct X86MachineState {
     DeviceState *ioapic2;
     GMappedFile *initrd_mapped_file;
     HotplugHandler *acpi_dev;
+    DeviceState *ghes_dev;
+    Notifier generic_error_notifier;
+    MemoryRegion einj_io;
 
     /*
      * Map the whole BIOS just underneath the 4 GiB address boundary. Only used
@@ -133,6 +137,12 @@ void x86_load_linux(X86MachineState *x86ms,
 
 bool x86_machine_is_smm_enabled(const X86MachineState *x86ms);
 bool x86_machine_is_acpi_enabled(const X86MachineState *x86ms);
+void x86_ghes_init(X86MachineState *x86ms);
+void x86_ghes_gsi_init(X86MachineState *x86ms);
+
+#define ACPI_GHES_GED_EVT_BASE   0xFEA00000
+#define ACPI_GHES_GED_REGS_BASE  (ACPI_GHES_GED_EVT_BASE + 0x200)
+#define ACPI_GHES_GED_IRQ        9
 
 /* Global System Interrupts */
 

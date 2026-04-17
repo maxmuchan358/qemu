@@ -185,6 +185,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
 
     pc_machine_init_sgx_epc(pcms);
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
+    x86_ghes_init(x86ms);
 
     if (kvm_enabled()) {
         kvmclock_create(pcmc->kvmclock_create_always);
@@ -235,6 +236,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     }
 
     gsi_state = pc_gsi_create(&x86ms->gsi, true);
+    x86_ghes_gsi_init(x86ms);
 
     pci_dev = pci_new_multifunction(-1, pcms->south_bridge);
     object_property_set_bool(OBJECT(pci_dev), "has-usb",

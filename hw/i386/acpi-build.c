@@ -35,6 +35,7 @@
 #include "hw/acpi/acpi-defs.h"
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/cpu.h"
+#include "hw/acpi/generic_event_device.h"
 #include "hw/acpi/pc-hotplug.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/acpi/bios-linker-loader.h"
@@ -46,6 +47,7 @@
 #include "hw/acpi/vmgenid.h"
 #include "hw/acpi/vmclock.h"
 #include "hw/acpi/erst.h"
+#include "hw/acpi/ghes.h"
 #include "hw/acpi/piix4.h"
 #include "system/tpm_backend.h"
 #include "hw/rtc/mc146818rtc_regs.h"
@@ -118,6 +120,11 @@ typedef struct AcpiMiscInfo {
     TPMVersion tpm_version;
 #endif
 } AcpiMiscInfo;
+
+static const AcpiNotificationSourceId hest_ghes_notify[] = {
+    { ACPI_HEST_SRC_ID_SYNC, ACPI_GHES_NOTIFY_SCI },
+    { ACPI_HEST_SRC_ID_QMP, ACPI_GHES_NOTIFY_NMI },
+};
 
 typedef struct FwCfgTPMConfig {
     uint32_t tpmppi_address;
@@ -946,6 +953,16 @@ build_dsdt(GArray *table_data, BIOSLinker *linker,
     if (vmbus_bridge) {
         sb_scope = aml_scope("_SB");
         aml_append(sb_scope, build_vmbus_device_aml(vmbus_bridge));
+        aml_append(dsdt, sb_scope);
+    }
+
+    if (x86ms->ghes_dev) {
+        sb_scope = aml_scope("_SB");
+        build_ged_aml(sb_scope, GED_DEVICE,
+                      HOTPLUG_HANDLER(x86ms->ghes_dev),
+                      ACPI_GHES_GED_IRQ, AML_SYSTEM_MEMORY,
+                      ACPI_GHES_GED_EVT_BASE);
+        aml_append(sb_scope, aml_error_device());
         aml_append(dsdt, sb_scope);
     }
 
@@ -2075,6 +2092,21 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
                        x86ms->oem_id, x86ms->oem_table_id, &pcms->cxl_devices_state);
     }
 
+    if (x86ms->ghes_dev) {
+        AcpiGedState *acpi_ged_state = ACPI_GED(x86ms->ghes_dev);
+        AcpiGhesState *ags = &acpi_ged_state->ghes_state;
+
+        acpi_add_table(table_offsets, tables_blob);
+        acpi_build_hest(ags, tables_blob, tables->hardware_errors,
+                        tables->linker,
+                        hest_ghes_notify, ARRAY_SIZE(hest_ghes_notify),
+                        x86ms->oem_id, x86ms->oem_table_id);
+        acpi_add_table(table_offsets, tables_blob);
+        acpi_build_einj(ags, tables_blob, tables->hardware_errors,
+                        tables->linker,
+                        x86ms->oem_id, x86ms->oem_table_id);
+    }
+
     acpi_add_table(table_offsets, tables_blob);
     build_waet(tables_blob, tables->linker, x86ms->oem_id, x86ms->oem_table_id);
 
@@ -2233,6 +2265,12 @@ void acpi_setup(void)
     if (vmgenid_dev) {
         vmgenid_add_fw_cfg(VMGENID(vmgenid_dev), x86ms->fw_cfg,
                            tables.vmgenid);
+    }
+
+    if (x86ms->ghes_dev) {
+        AcpiGedState *acpi_ged_state = ACPI_GED(x86ms->ghes_dev);
+        acpi_ghes_add_fw_cfg(&acpi_ged_state->ghes_state, x86ms->fw_cfg,
+                             tables.hardware_errors);
     }
 
     build_state->rsdp_mr = acpi_add_rom_blob(acpi_build_update,
