@@ -57,7 +57,20 @@ struct PCSpkState {
     unsigned int play_pos;
     uint8_t data_on;
     uint8_t dummy_refresh_clock;
+    uint8_t nmi_status;
 };
+
+void pcspk_set_nmi_status(ISADevice *dev, uint8_t status)
+{
+    PCSpkState *s;
+
+    if (!dev || !object_dynamic_cast(OBJECT(dev), TYPE_PC_SPEAKER)) {
+        return;
+    }
+
+    s = PC_SPEAKER(dev);
+    s->nmi_status = status & (PCSPK_NMI_IOCHK | PCSPK_NMI_SERR);
+}
 
 static const char *s_spk = "pcspk";
 
@@ -143,7 +156,7 @@ static uint64_t pcspk_io_read(void *opaque, hwaddr addr,
     s->dummy_refresh_clock ^= (1 << 4);
 
     val = ch.gate | (s->data_on << 1) | s->dummy_refresh_clock |
-       (ch.out << 5);
+       (ch.out << 5) | s->nmi_status;
 
     trace_pcspk_io_read(s->iobase, val);
 
@@ -157,6 +170,13 @@ static void pcspk_io_write(void *opaque, hwaddr addr, uint64_t val,
     const int gate = val & 1;
 
     trace_pcspk_io_write(s->iobase, val);
+
+    if (val & 0x04) {
+        s->nmi_status &= ~PCSPK_NMI_SERR;
+    }
+    if (val & 0x08) {
+        s->nmi_status &= ~PCSPK_NMI_IOCHK;
+    }
 
     s->data_on = (val >> 1) & 1;
     pit_set_gate(s->pit, 2, gate);
@@ -203,11 +223,12 @@ static void pcspk_realizefn(DeviceState *dev, Error **errp)
 
 static const VMStateDescription vmstate_spk = {
     .name = "pcspk",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(data_on, PCSpkState),
         VMSTATE_UINT8(dummy_refresh_clock, PCSpkState),
+        VMSTATE_UINT8_V(nmi_status, PCSpkState, 2),
         VMSTATE_END_OF_LIST()
     }
 };

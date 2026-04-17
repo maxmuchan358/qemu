@@ -25,6 +25,13 @@
 #ifndef HW_PCSPK_H
 #define HW_PCSPK_H
 
+#include "hw/isa/isa.h"
+
 #define TYPE_PC_SPEAKER "isa-pcspk"
+
+#define PCSPK_NMI_IOCHK 0x40
+#define PCSPK_NMI_SERR  0x80
+
+void pcspk_set_nmi_status(ISADevice *dev, uint8_t status);
 
 #endif /* HW_PCSPK_H */
