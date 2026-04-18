@@ -37,6 +37,7 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "qemu/module.h"
+#include "system/address-spaces.h"
 
 /****************************************************************************
  * Q35 host
@@ -263,6 +264,156 @@ static const TypeInfo q35_host_info = {
  * MCH D0:F0
  */
 
+#define ASL_IBECC_DEVICE_ID             0x464a
+#define ASL_IBECC_MCHBAR                0x48
+#define ASL_IBECC_MCHBAR_SIZE           8
+#define ASL_IBECC_MCHBAR_EN             0x1ULL
+#define ASL_IBECC_MCHBAR_ADDR           0x200000000ULL
+#define ASL_IBECC_TOM                   0xa0
+#define ASL_IBECC_TOUUD                 0xa8
+#define ASL_IBECC_TOLUD                 0xbc
+#define ASL_IBECC_ERRSTS                0xc8
+#define ASL_IBECC_ERRCMD                0xca
+#define ASL_IBECC_CAPID_E               0xf0
+#define ASL_IBECC_CAPID_E_DISABLED      BIT(12)
+#define ASL_IBECC_ERRSTS_CE             BIT(6)
+#define ASL_IBECC_ERRSTS_UE             BIT(7)
+
+#define ASL_IBECC_ACTIVATE              0xd400
+#define ASL_IBECC_ACTIVATE_EN           BIT(0)
+#define ASL_IBECC_ECC_ERROR_LOG         0xd468
+#define ASL_IBECC_ECC_ERROR_LOG_CE      BIT_ULL(62)
+#define ASL_IBECC_ECC_ERROR_LOG_UE      BIT_ULL(63)
+#define ASL_IBECC_MAD_INTER_CHANNEL     0xd800
+#define ASL_IBECC_MAD_INTRA_CH0         0xd804
+#define ASL_IBECC_MAD_INTRA_CH1         0xd808
+#define ASL_IBECC_MAD_DIMM_CH0          0xd80c
+#define ASL_IBECC_MAD_DIMM_CH1          0xd810
+#define ASL_IBECC_CHANNEL_HASH          0xd824
+#define ASL_IBECC_CHANNEL_EHASH         0xd828
+#define ASL_IBECC_MAD_MC_HASH           0xd9b8
+
+static uint64_t asl_ibecc_read_reg(MCHPCIState *mch, hwaddr addr)
+{
+    switch (addr) {
+    case ASL_IBECC_ACTIVATE:
+        return ASL_IBECC_ACTIVATE_EN;
+    case ASL_IBECC_ECC_ERROR_LOG:
+        return mch->asl_ibecc_ecclog;
+    case ASL_IBECC_MAD_INTER_CHANNEL:
+        return 0;
+    case ASL_IBECC_MAD_INTRA_CH0:
+    case ASL_IBECC_MAD_INTRA_CH1:
+    case ASL_IBECC_CHANNEL_HASH:
+    case ASL_IBECC_CHANNEL_EHASH:
+    case ASL_IBECC_MAD_MC_HASH:
+        return 0;
+    case ASL_IBECC_MAD_DIMM_CH0:
+        return 0x2;
+    case ASL_IBECC_MAD_DIMM_CH1:
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static void asl_ibecc_update_errsts(MCHPCIState *mch)
+{
+    PCIDevice *d = PCI_DEVICE(mch);
+    uint16_t errsts = 0;
+
+    if (mch->asl_ibecc_ecclog & ASL_IBECC_ECC_ERROR_LOG_CE) {
+        errsts |= ASL_IBECC_ERRSTS_CE;
+    }
+    if (mch->asl_ibecc_ecclog & ASL_IBECC_ECC_ERROR_LOG_UE) {
+        errsts |= ASL_IBECC_ERRSTS_UE;
+    }
+
+    pci_set_word(d->config + ASL_IBECC_ERRSTS, errsts);
+}
+
+static void asl_ibecc_write_reg(MCHPCIState *mch, hwaddr addr,
+                                uint64_t val, unsigned size)
+{
+    switch (addr) {
+    case ASL_IBECC_ECC_ERROR_LOG:
+        if (size == 8) {
+            if (mch->asl_ibecc_ecclog && val == mch->asl_ibecc_ecclog) {
+                mch->asl_ibecc_ecclog = 0;
+            } else {
+                mch->asl_ibecc_ecclog = val;
+            }
+            asl_ibecc_update_errsts(mch);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static uint64_t asl_ibecc_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MCHPCIState *mch = opaque;
+    uint64_t val = asl_ibecc_read_reg(mch, addr & ~0x7ULL);
+
+    if (size == 8) {
+        return val;
+    }
+    if (size == 4) {
+        return (addr & 4) ? (val >> 32) : (val & UINT32_MAX);
+    }
+
+    return 0;
+}
+
+static void asl_ibecc_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    MCHPCIState *mch = opaque;
+
+    if (size == 4 && (addr & 4)) {
+        uint64_t cur = asl_ibecc_read_reg(mch, addr & ~0x7ULL);
+        val = (cur & UINT32_MAX) | (val << 32);
+        addr &= ~0x7ULL;
+        size = 8;
+    }
+
+    asl_ibecc_write_reg(mch, addr, val, size);
+}
+
+static const MemoryRegionOps asl_ibecc_mmio_ops = {
+    .read = asl_ibecc_mmio_read,
+    .write = asl_ibecc_mmio_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 8,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void mch_update_asl_ibecc(MCHPCIState *mch)
+{
+    PCIDevice *d = PCI_DEVICE(mch);
+    uint64_t mchbar = pci_get_quad(d->config + ASL_IBECC_MCHBAR);
+    bool enabled = mch->x_asl_ibecc && (mchbar & ASL_IBECC_MCHBAR_EN);
+    hwaddr addr = mchbar & ~((1ULL << 17) - 1);
+
+    memory_region_transaction_begin();
+
+    if (mch->asl_ibecc_mapped) {
+        memory_region_del_subregion(mch->system_memory, &mch->asl_ibecc_bar);
+        mch->asl_ibecc_mapped = false;
+    }
+
+    if (enabled) {
+        memory_region_add_subregion(mch->system_memory, addr,
+                                    &mch->asl_ibecc_bar);
+        mch->asl_ibecc_mapped = true;
+    }
+
+    memory_region_transaction_commit();
+}
+
 static uint64_t blackhole_read(void *ptr, hwaddr reg, unsigned size)
 {
     return 0xffffffff;
@@ -461,8 +612,24 @@ static void mch_write_config(PCIDevice *d,
                               uint32_t address, uint32_t val, int len)
 {
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
+    uint16_t old_errsts = pci_get_word(d->config + ASL_IBECC_ERRSTS);
 
     pci_default_write_config(d, address, val, len);
+
+    if (mch->x_asl_ibecc) {
+        if (ranges_overlap(address, len, ASL_IBECC_MCHBAR,
+                           ASL_IBECC_MCHBAR_SIZE)) {
+            mch_update_asl_ibecc(mch);
+        }
+
+        if (ranges_overlap(address, len, ASL_IBECC_ERRSTS, 2)) {
+            uint16_t clear = pci_get_word(d->config + ASL_IBECC_ERRSTS);
+            pci_set_word(d->config + ASL_IBECC_ERRSTS, old_errsts & ~clear);
+            if (!pci_get_word(d->config + ASL_IBECC_ERRSTS)) {
+                mch->asl_ibecc_ecclog = 0;
+            }
+        }
+    }
 
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PAM0,
                        MCH_HOST_BRIDGE_PAM_SIZE)) {
@@ -496,6 +663,9 @@ static void mch_write_config(PCIDevice *d,
 static void mch_update(MCHPCIState *mch)
 {
     mch_update_pciexbar(mch);
+    if (mch->x_asl_ibecc) {
+        mch_update_asl_ibecc(mch);
+    }
 
     mch_update_pam(mch);
     if (mch->has_smm_ranges) {
@@ -539,9 +709,27 @@ static void mch_reset(DeviceState *qdev)
 {
     PCIDevice *d = PCI_DEVICE(qdev);
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
+    uint64_t tom = mch->below_4g_mem_size + mch->above_4g_mem_size;
 
     pci_set_quad(d->config + MCH_HOST_BRIDGE_PCIEXBAR,
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
+
+    if (mch->x_asl_ibecc) {
+        pci_set_word(d->config + PCI_DEVICE_ID, ASL_IBECC_DEVICE_ID);
+        pci_set_quad(d->config + ASL_IBECC_MCHBAR,
+                     ASL_IBECC_MCHBAR_ADDR | ASL_IBECC_MCHBAR_EN);
+        pci_set_quad(d->config + ASL_IBECC_TOM, tom & ~(MiB - 1));
+        pci_set_quad(d->config + ASL_IBECC_TOUUD, tom & ~(MiB - 1));
+        pci_set_long(d->config + ASL_IBECC_TOLUD,
+                     mch->below_4g_mem_size & ~(MiB - 1));
+        pci_set_long(d->config + ASL_IBECC_CAPID_E, 0);
+        pci_set_word(d->config + ASL_IBECC_ERRSTS, 0);
+        pci_set_word(d->config + ASL_IBECC_ERRCMD, 0);
+        memset(d->wmask + ASL_IBECC_MCHBAR, 0xff, ASL_IBECC_MCHBAR_SIZE);
+        memset(d->wmask + ASL_IBECC_ERRSTS, 0xff, 2);
+        memset(d->wmask + ASL_IBECC_ERRCMD, 0xff, 2);
+        mch->asl_ibecc_ecclog = 0;
+    }
 
     if (mch->has_smm_ranges) {
         d->config[MCH_HOST_BRIDGE_SMRAM] = MCH_HOST_BRIDGE_SMRAM_DEFAULT;
@@ -565,6 +753,12 @@ static void mch_realize(PCIDevice *d, Error **errp)
 {
     int i;
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
+
+    if (mch->x_asl_ibecc) {
+        memory_region_init_io(&mch->asl_ibecc_bar, OBJECT(mch),
+                              &asl_ibecc_mmio_ops, mch,
+                              "asl-ibecc-mmio", 0x10000);
+    }
 
     if (mch->ext_tseg_mbytes > MCH_HOST_BRIDGE_EXT_TSEG_MBYTES_MAX) {
         error_setg(errp, "invalid extended-tseg-mbytes value: %" PRIu16,
@@ -658,9 +852,172 @@ static void mch_realize(PCIDevice *d, Error **errp)
 }
 
 static const Property mch_props[] = {
+    DEFINE_PROP_BOOL("x-asl-ibecc", MCHPCIState, x_asl_ibecc, false),
     DEFINE_PROP_UINT16("extended-tseg-mbytes", MCHPCIState, ext_tseg_mbytes,
                        64),
     DEFINE_PROP_BOOL("smbase-smram", MCHPCIState, has_smram_at_smbase, true),
+};
+
+#define TYPE_ASL_IBECC_DEVICE "asl-ibecc"
+OBJECT_DECLARE_SIMPLE_TYPE(ASLIBECCState, ASL_IBECC_DEVICE)
+
+typedef struct ASLIBECCState {
+    PCIDevice parent_obj;
+    MemoryRegion mmio;
+    uint64_t ecclog;
+} ASLIBECCState;
+
+static ASLIBECCState *global_asl_ibecc;
+
+static void asl_ibecc_dev_update_errsts(ASLIBECCState *s)
+{
+    uint16_t errsts = 0;
+    PCIDevice *d = PCI_DEVICE(s);
+
+    if (s->ecclog & ASL_IBECC_ECC_ERROR_LOG_CE) {
+        errsts |= ASL_IBECC_ERRSTS_CE;
+    }
+    if (s->ecclog & ASL_IBECC_ECC_ERROR_LOG_UE) {
+        errsts |= ASL_IBECC_ERRSTS_UE;
+    }
+
+    pci_set_word(d->config + ASL_IBECC_ERRSTS, errsts);
+}
+
+static uint64_t asl_ibecc_dev_reg_read(ASLIBECCState *s, hwaddr addr)
+{
+    switch (addr) {
+    case ASL_IBECC_ACTIVATE:
+        return ASL_IBECC_ACTIVATE_EN;
+    case ASL_IBECC_ECC_ERROR_LOG:
+        return s->ecclog;
+    case ASL_IBECC_MAD_INTER_CHANNEL:
+        return 0;
+    case ASL_IBECC_MAD_INTRA_CH0:
+    case ASL_IBECC_MAD_INTRA_CH1:
+    case ASL_IBECC_CHANNEL_HASH:
+    case ASL_IBECC_CHANNEL_EHASH:
+    case ASL_IBECC_MAD_MC_HASH:
+        return 0;
+    case ASL_IBECC_MAD_DIMM_CH0:
+        return 0x2;
+    case ASL_IBECC_MAD_DIMM_CH1:
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static uint64_t asl_ibecc_dev_mmio_read(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    ASLIBECCState *s = opaque;
+
+    if (size == 8 && addr == ASL_IBECC_ECC_ERROR_LOG) {
+        return s->ecclog;
+    }
+
+    return asl_ibecc_dev_reg_read(s, addr & ~0x3ULL) & UINT32_MAX;
+}
+
+static void asl_ibecc_dev_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+                                     unsigned size)
+{
+    ASLIBECCState *s = opaque;
+
+    if ((addr & ~0x3ULL) == ASL_IBECC_ECC_ERROR_LOG) {
+        if (size == 8) {
+            if (s->ecclog && val == s->ecclog) {
+                s->ecclog = 0;
+            } else {
+                s->ecclog = val;
+            }
+            asl_ibecc_dev_update_errsts(s);
+        }
+    }
+}
+
+static const MemoryRegionOps asl_ibecc_dev_mmio_ops = {
+    .read = asl_ibecc_dev_mmio_read,
+    .write = asl_ibecc_dev_mmio_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 8,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 8,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void asl_ibecc_dev_config_write(PCIDevice *d,
+                                       uint32_t address, uint32_t val, int len)
+{
+    ASLIBECCState *s = ASL_IBECC_DEVICE(d);
+    uint16_t old_errsts = pci_get_word(d->config + ASL_IBECC_ERRSTS);
+
+    pci_default_write_config(d, address, val, len);
+
+    if (ranges_overlap(address, len, ASL_IBECC_ERRSTS, 2)) {
+        uint16_t clear = pci_get_word(d->config + ASL_IBECC_ERRSTS);
+        pci_set_word(d->config + ASL_IBECC_ERRSTS, old_errsts & ~clear);
+        if (!pci_get_word(d->config + ASL_IBECC_ERRSTS)) {
+            s->ecclog = 0;
+        }
+    }
+}
+
+static void asl_ibecc_dev_reset(DeviceState *dev)
+{
+    ASLIBECCState *s = ASL_IBECC_DEVICE(dev);
+    PCIDevice *d = PCI_DEVICE(dev);
+
+    pci_set_quad(d->config + ASL_IBECC_MCHBAR,
+                 ASL_IBECC_MCHBAR_ADDR | ASL_IBECC_MCHBAR_EN);
+    pci_set_quad(d->config + ASL_IBECC_TOM, 0x80000000ULL);
+    pci_set_quad(d->config + ASL_IBECC_TOUUD, 0x80000000ULL);
+    pci_set_long(d->config + ASL_IBECC_TOLUD, 0x80000000U);
+    pci_set_long(d->config + ASL_IBECC_CAPID_E, 0);
+    pci_set_word(d->config + ASL_IBECC_ERRSTS, 0);
+    pci_set_word(d->config + ASL_IBECC_ERRCMD, 0);
+    memset(d->wmask + ASL_IBECC_MCHBAR, 0xff, ASL_IBECC_MCHBAR_SIZE);
+    memset(d->wmask + ASL_IBECC_ERRSTS, 0xff, 2);
+    memset(d->wmask + ASL_IBECC_ERRCMD, 0xff, 2);
+    s->ecclog = 0;
+}
+
+static void asl_ibecc_dev_realize(PCIDevice *d, Error **errp)
+{
+    ASLIBECCState *s = ASL_IBECC_DEVICE(d);
+
+    memory_region_init_io(&s->mmio, OBJECT(s), &asl_ibecc_dev_mmio_ops, s,
+                          "asl-ibecc-mmio", 0x10000);
+    memory_region_add_subregion(get_system_memory(), ASL_IBECC_MCHBAR_ADDR,
+                                &s->mmio);
+    global_asl_ibecc = s;
+}
+
+static void asl_ibecc_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    k->realize = asl_ibecc_dev_realize;
+    k->config_write = asl_ibecc_dev_config_write;
+    device_class_set_legacy_reset(dc, asl_ibecc_dev_reset);
+    dc->desc = "Minimal Amston Lake IBECC device";
+    k->vendor_id = PCI_VENDOR_ID_INTEL;
+    k->device_id = ASL_IBECC_DEVICE_ID;
+    k->revision = 0;
+    k->class_id = PCI_CLASS_MEMORY_OTHER;
+}
+
+static const TypeInfo asl_ibecc_info = {
+    .name = TYPE_ASL_IBECC_DEVICE,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(ASLIBECCState),
+    .class_init = asl_ibecc_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void mch_class_init(ObjectClass *klass, const void *data)
@@ -705,10 +1062,26 @@ static const TypeInfo mch_info = {
     },
 };
 
+void q35_asl_ibecc_inject_error(uint64_t phys_addr, bool uncorrected)
+{
+    uint64_t ecclog;
+
+    if (!global_asl_ibecc) {
+        return;
+    }
+
+    ecclog = phys_addr & ~0x1fULL;
+    ecclog |= uncorrected ? ASL_IBECC_ECC_ERROR_LOG_UE
+                          : ASL_IBECC_ECC_ERROR_LOG_CE;
+    global_asl_ibecc->ecclog = ecclog;
+    asl_ibecc_dev_update_errsts(global_asl_ibecc);
+}
+
 static void q35_register(void)
 {
     type_register_static(&mch_info);
     type_register_static(&q35_host_info);
+    type_register_static(&asl_ibecc_info);
 }
 
 type_init(q35_register);

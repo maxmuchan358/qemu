@@ -56,6 +56,11 @@ struct MCHPCIState {
     uint64_t above_4g_mem_size;
     uint64_t pci_hole64_size;
     uint16_t ext_tseg_mbytes;
+
+    bool x_asl_ibecc;
+    bool asl_ibecc_mapped;
+    MemoryRegion asl_ibecc_bar;
+    uint64_t asl_ibecc_ecclog;
 };
 
 struct Q35PCIHost {
@@ -188,5 +193,7 @@ struct Q35PCIHost {
  */
 #define Q35_PSEUDO_BUS_PLATFORM         (0xff)
 #define Q35_PSEUDO_DEVFN_IOAPIC         (0x00)
+
+void q35_asl_ibecc_inject_error(uint64_t phys_addr, bool uncorrected);
 
 #endif /* HW_Q35_H */
