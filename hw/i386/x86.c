@@ -43,6 +43,7 @@
 #include "hw/core/nmi.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
+#include "hw/pci-host/q35.h"
 #include "system/address-spaces.h"
 #include "kvm/kvm_i386.h"
 
@@ -242,6 +243,8 @@ static void x86_einj_inject(X86MachineState *x86ms)
         error_report("EINJ unsupported error type 0x%x", params.type);
         return;
     }
+
+    q35_asl_ibecc_inject_error(phys_addr, sev != 2);
 
     if (!acpi_ghes_memory_errors_with_severity(ags, ACPI_HEST_SRC_ID_SYNC,
                                                phys_addr, sev,
