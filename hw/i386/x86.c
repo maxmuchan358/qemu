@@ -167,6 +167,11 @@ static void x86_nmi(NMIState *n, int cpu_index, Error **errp)
         X86MachineState *x86ms = X86_MACHINE(ms);
 
         pcspk_set_nmi_status(pcms->pcspk, x86ms->nmi_source);
+        if (x86ms->nmi_source == PCSPK_NMI_SERR &&
+            x86ms->serr_ibecc_enabled) {
+            q35_asl_ibecc_inject_error(x86ms->serr_ibecc_addr,
+                                       x86ms->serr_ibecc_uncorrected);
+        }
     }
 
     CPU_FOREACH(cs) {
@@ -505,6 +510,65 @@ static void x86_machine_set_nmi_source(Object *obj, Visitor *v,
     x86ms->nmi_source = nmi_source & (PCSPK_NMI_IOCHK | PCSPK_NMI_SERR);
 }
 
+static void x86_machine_get_serr_ibecc_enabled(Object *obj, Visitor *v,
+                                               const char *name,
+                                               void *opaque, Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+    bool enabled = x86ms->serr_ibecc_enabled;
+
+    visit_type_bool(v, name, &enabled, errp);
+}
+
+static void x86_machine_set_serr_ibecc_enabled(Object *obj, Visitor *v,
+                                               const char *name,
+                                               void *opaque, Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+
+    visit_type_bool(v, name, &x86ms->serr_ibecc_enabled, errp);
+}
+
+static void x86_machine_get_serr_ibecc_uncorrected(Object *obj, Visitor *v,
+                                                   const char *name,
+                                                   void *opaque,
+                                                   Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+    bool uncorrected = x86ms->serr_ibecc_uncorrected;
+
+    visit_type_bool(v, name, &uncorrected, errp);
+}
+
+static void x86_machine_set_serr_ibecc_uncorrected(Object *obj, Visitor *v,
+                                                   const char *name,
+                                                   void *opaque,
+                                                   Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+
+    visit_type_bool(v, name, &x86ms->serr_ibecc_uncorrected, errp);
+}
+
+static void x86_machine_get_serr_ibecc_addr(Object *obj, Visitor *v,
+                                            const char *name,
+                                            void *opaque, Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+    uint64_t addr = x86ms->serr_ibecc_addr;
+
+    visit_type_uint64(v, name, &addr, errp);
+}
+
+static void x86_machine_set_serr_ibecc_addr(Object *obj, Visitor *v,
+                                            const char *name,
+                                            void *opaque, Error **errp)
+{
+    X86MachineState *x86ms = X86_MACHINE(obj);
+
+    visit_type_uint64(v, name, &x86ms->serr_ibecc_addr, errp);
+}
+
 static void machine_get_sgx_epc(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
@@ -549,6 +613,9 @@ static void x86_machine_initfn(Object *obj)
     x86ms->oem_table_id = g_strndup(ACPI_BUILD_APPNAME8, 8);
     x86ms->bus_lock_ratelimit = 0;
     x86ms->nmi_source = 0;
+    x86ms->serr_ibecc_enabled = false;
+    x86ms->serr_ibecc_uncorrected = true;
+    x86ms->serr_ibecc_addr = 0x12345000;
     x86ms->above_4g_mem_start = 4 * GiB;
 }
 
@@ -618,6 +685,29 @@ static void x86_machine_class_init(ObjectClass *oc, const void *data)
                               NULL, NULL);
     object_class_property_set_description(oc, X86_MACHINE_NMI_SOURCE,
             "Set the x86 NMI source latch: 0=unknown, 64=IOCHK, 128=SERR");
+
+    object_class_property_add(oc, X86_MACHINE_SERR_IBECC_ENABLED, "bool",
+                              x86_machine_get_serr_ibecc_enabled,
+                              x86_machine_set_serr_ibecc_enabled,
+                              NULL, NULL);
+    object_class_property_set_description(oc, X86_MACHINE_SERR_IBECC_ENABLED,
+            "Inject a synthetic IBECC ECC record alongside SERR NMI delivery");
+
+    object_class_property_add(oc, X86_MACHINE_SERR_IBECC_UNCORRECTED,
+                              "bool",
+                              x86_machine_get_serr_ibecc_uncorrected,
+                              x86_machine_set_serr_ibecc_uncorrected,
+                              NULL, NULL);
+    object_class_property_set_description(oc,
+            X86_MACHINE_SERR_IBECC_UNCORRECTED,
+            "Choose whether the SERR-coupled IBECC error is UE (true) or CE (false)");
+
+    object_class_property_add(oc, X86_MACHINE_SERR_IBECC_ADDR, "uint64",
+                              x86_machine_get_serr_ibecc_addr,
+                              x86_machine_set_serr_ibecc_addr,
+                              NULL, NULL);
+    object_class_property_set_description(oc, X86_MACHINE_SERR_IBECC_ADDR,
+            "Physical address recorded in the synthetic SERR-coupled IBECC error");
 
     object_class_property_add(oc, "sgx-epc", "SgxEPC",
         machine_get_sgx_epc, machine_set_sgx_epc,

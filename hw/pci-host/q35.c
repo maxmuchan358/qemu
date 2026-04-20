@@ -391,6 +391,8 @@ static const MemoryRegionOps asl_ibecc_mmio_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static MCHPCIState *global_mch_asl_ibecc;
+
 static void mch_update_asl_ibecc(MCHPCIState *mch)
 {
     PCIDevice *d = PCI_DEVICE(mch);
@@ -715,7 +717,10 @@ static void mch_reset(DeviceState *qdev)
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
 
     if (mch->x_asl_ibecc) {
-        pci_set_word(d->config + PCI_DEVICE_ID, ASL_IBECC_DEVICE_ID);
+        /* Keep the q35 host bridge PCI ID stable so OVMF platform init
+         * still recognizes the machine, while exposing the IBECC register
+         * block through the MCH config space and MCHBAR.
+         */
         pci_set_quad(d->config + ASL_IBECC_MCHBAR,
                      ASL_IBECC_MCHBAR_ADDR | ASL_IBECC_MCHBAR_EN);
         pci_set_quad(d->config + ASL_IBECC_TOM, tom & ~(MiB - 1));
@@ -758,6 +763,7 @@ static void mch_realize(PCIDevice *d, Error **errp)
         memory_region_init_io(&mch->asl_ibecc_bar, OBJECT(mch),
                               &asl_ibecc_mmio_ops, mch,
                               "asl-ibecc-mmio", 0x10000);
+        global_mch_asl_ibecc = mch;
     }
 
     if (mch->ext_tseg_mbytes > MCH_HOST_BRIDGE_EXT_TSEG_MBYTES_MAX) {
@@ -1066,15 +1072,19 @@ void q35_asl_ibecc_inject_error(uint64_t phys_addr, bool uncorrected)
 {
     uint64_t ecclog;
 
-    if (!global_asl_ibecc) {
-        return;
-    }
-
     ecclog = phys_addr & ~0x1fULL;
     ecclog |= uncorrected ? ASL_IBECC_ECC_ERROR_LOG_UE
                           : ASL_IBECC_ECC_ERROR_LOG_CE;
-    global_asl_ibecc->ecclog = ecclog;
-    asl_ibecc_dev_update_errsts(global_asl_ibecc);
+
+    if (global_mch_asl_ibecc && global_mch_asl_ibecc->x_asl_ibecc) {
+        global_mch_asl_ibecc->asl_ibecc_ecclog = ecclog;
+        asl_ibecc_update_errsts(global_mch_asl_ibecc);
+    }
+
+    if (global_asl_ibecc) {
+        global_asl_ibecc->ecclog = ecclog;
+        asl_ibecc_dev_update_errsts(global_asl_ibecc);
+    }
 }
 
 static void q35_register(void)

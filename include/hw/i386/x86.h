@@ -96,18 +96,24 @@ struct X86MachineState {
      */
     uint64_t bus_lock_ratelimit;
     uint8_t nmi_source;
+    bool serr_ibecc_enabled;
+    bool serr_ibecc_uncorrected;
+    uint64_t serr_ibecc_addr;
 
     IgvmCfg *igvm;
 };
 
-#define X86_MACHINE_SMM              "smm"
-#define X86_MACHINE_ACPI             "acpi"
-#define X86_MACHINE_PIT              "pit"
-#define X86_MACHINE_PIC              "pic"
-#define X86_MACHINE_OEM_ID           "x-oem-id"
-#define X86_MACHINE_OEM_TABLE_ID     "x-oem-table-id"
+#define X86_MACHINE_SMM                 "smm"
+#define X86_MACHINE_ACPI                "acpi"
+#define X86_MACHINE_PIT                 "pit"
+#define X86_MACHINE_PIC                 "pic"
+#define X86_MACHINE_OEM_ID              "x-oem-id"
+#define X86_MACHINE_OEM_TABLE_ID        "x-oem-table-id"
 #define X86_MACHINE_BUS_LOCK_RATELIMIT  "bus-lock-ratelimit"
 #define X86_MACHINE_NMI_SOURCE          "x-nmi-source"
+#define X86_MACHINE_SERR_IBECC_ENABLED  "x-serr-ibecc-enabled"
+#define X86_MACHINE_SERR_IBECC_UNCORRECTED "x-serr-ibecc-uncorrected"
+#define X86_MACHINE_SERR_IBECC_ADDR     "x-serr-ibecc-addr"
 
 #define TYPE_X86_MACHINE   MACHINE_TYPE_NAME("x86")
 OBJECT_DECLARE_TYPE(X86MachineState, X86MachineClass, X86_MACHINE)
