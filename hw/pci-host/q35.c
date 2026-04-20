@@ -354,16 +354,12 @@ static void asl_ibecc_write_reg(MCHPCIState *mch, hwaddr addr,
 static uint64_t asl_ibecc_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     MCHPCIState *mch = opaque;
-    uint64_t val = asl_ibecc_read_reg(mch, addr & ~0x7ULL);
 
-    if (size == 8) {
-        return val;
-    }
-    if (size == 4) {
-        return (addr & 4) ? (val >> 32) : (val & UINT32_MAX);
+    if (size == 8 && addr == ASL_IBECC_ECC_ERROR_LOG) {
+        return mch->asl_ibecc_ecclog;
     }
 
-    return 0;
+    return asl_ibecc_read_reg(mch, addr & ~0x3ULL) & UINT32_MAX;
 }
 
 static void asl_ibecc_mmio_write(void *opaque, hwaddr addr, uint64_t val,
@@ -371,14 +367,9 @@ static void asl_ibecc_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 {
     MCHPCIState *mch = opaque;
 
-    if (size == 4 && (addr & 4)) {
-        uint64_t cur = asl_ibecc_read_reg(mch, addr & ~0x7ULL);
-        val = (cur & UINT32_MAX) | (val << 32);
-        addr &= ~0x7ULL;
-        size = 8;
+    if ((addr & ~0x3ULL) == ASL_IBECC_ECC_ERROR_LOG && size == 8) {
+        asl_ibecc_write_reg(mch, addr, val, size);
     }
-
-    asl_ibecc_write_reg(mch, addr, val, size);
 }
 
 static const MemoryRegionOps asl_ibecc_mmio_ops = {
@@ -871,9 +862,30 @@ typedef struct ASLIBECCState {
     PCIDevice parent_obj;
     MemoryRegion mmio;
     uint64_t ecclog;
+    bool proxy_to_mch;
 } ASLIBECCState;
 
 static ASLIBECCState *global_asl_ibecc;
+
+static void asl_ibecc_dev_sync_from_mch(ASLIBECCState *s)
+{
+    PCIDevice *d = PCI_DEVICE(s);
+    uint64_t tom = 0x80000000ULL;
+    uint64_t mchbar = ASL_IBECC_MCHBAR_ADDR | ASL_IBECC_MCHBAR_EN;
+    uint32_t tolud = 0x80000000U;
+
+    if (s->proxy_to_mch && global_mch_asl_ibecc) {
+        tom = global_mch_asl_ibecc->below_4g_mem_size +
+              global_mch_asl_ibecc->above_4g_mem_size;
+        tolud = global_mch_asl_ibecc->below_4g_mem_size & ~(MiB - 1);
+        s->ecclog = global_mch_asl_ibecc->asl_ibecc_ecclog;
+    }
+
+    pci_set_quad(d->config + ASL_IBECC_MCHBAR, mchbar);
+    pci_set_quad(d->config + ASL_IBECC_TOM, tom & ~(MiB - 1));
+    pci_set_quad(d->config + ASL_IBECC_TOUUD, tom & ~(MiB - 1));
+    pci_set_long(d->config + ASL_IBECC_TOLUD, tolud);
+}
 
 static void asl_ibecc_dev_update_errsts(ASLIBECCState *s)
 {
@@ -975,11 +987,7 @@ static void asl_ibecc_dev_reset(DeviceState *dev)
     ASLIBECCState *s = ASL_IBECC_DEVICE(dev);
     PCIDevice *d = PCI_DEVICE(dev);
 
-    pci_set_quad(d->config + ASL_IBECC_MCHBAR,
-                 ASL_IBECC_MCHBAR_ADDR | ASL_IBECC_MCHBAR_EN);
-    pci_set_quad(d->config + ASL_IBECC_TOM, 0x80000000ULL);
-    pci_set_quad(d->config + ASL_IBECC_TOUUD, 0x80000000ULL);
-    pci_set_long(d->config + ASL_IBECC_TOLUD, 0x80000000U);
+    asl_ibecc_dev_sync_from_mch(s);
     pci_set_long(d->config + ASL_IBECC_CAPID_E, 0);
     pci_set_word(d->config + ASL_IBECC_ERRSTS, 0);
     pci_set_word(d->config + ASL_IBECC_ERRCMD, 0);
@@ -993,12 +1001,25 @@ static void asl_ibecc_dev_realize(PCIDevice *d, Error **errp)
 {
     ASLIBECCState *s = ASL_IBECC_DEVICE(d);
 
-    memory_region_init_io(&s->mmio, OBJECT(s), &asl_ibecc_dev_mmio_ops, s,
-                          "asl-ibecc-mmio", 0x10000);
-    memory_region_add_subregion(get_system_memory(), ASL_IBECC_MCHBAR_ADDR,
-                                &s->mmio);
+    if (s->proxy_to_mch) {
+        if (!global_mch_asl_ibecc || !global_mch_asl_ibecc->x_asl_ibecc) {
+            error_setg(errp,
+                       "asl-ibecc proxy requires mch.x-asl-ibecc=true");
+            return;
+        }
+    } else {
+        memory_region_init_io(&s->mmio, OBJECT(s), &asl_ibecc_dev_mmio_ops, s,
+                              "asl-ibecc-mmio", 0x10000);
+        memory_region_add_subregion(get_system_memory(), ASL_IBECC_MCHBAR_ADDR,
+                                    &s->mmio);
+    }
+
     global_asl_ibecc = s;
 }
+
+static const Property asl_ibecc_props[] = {
+    DEFINE_PROP_BOOL("x-mch-proxy", ASLIBECCState, proxy_to_mch, false),
+};
 
 static void asl_ibecc_class_init(ObjectClass *klass, const void *data)
 {
@@ -1008,6 +1029,7 @@ static void asl_ibecc_class_init(ObjectClass *klass, const void *data)
     k->realize = asl_ibecc_dev_realize;
     k->config_write = asl_ibecc_dev_config_write;
     device_class_set_legacy_reset(dc, asl_ibecc_dev_reset);
+    device_class_set_props(dc, asl_ibecc_props);
     dc->desc = "Minimal Amston Lake IBECC device";
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = ASL_IBECC_DEVICE_ID;
