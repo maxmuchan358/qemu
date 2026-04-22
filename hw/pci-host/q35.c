@@ -265,6 +265,7 @@ static const TypeInfo q35_host_info = {
  */
 
 #define ASL_IBECC_DEVICE_ID             0x464a
+#define ASL_IBECC_MCE_DEVICE_ID         0x4678
 #define ASL_IBECC_MCHBAR                0x48
 #define ASL_IBECC_MCHBAR_SIZE           8
 #define ASL_IBECC_MCHBAR_EN             0x1ULL
@@ -863,6 +864,7 @@ typedef struct ASLIBECCState {
     MemoryRegion mmio;
     uint64_t ecclog;
     bool proxy_to_mch;
+    bool machine_check;
 } ASLIBECCState;
 
 static ASLIBECCState *global_asl_ibecc;
@@ -1001,6 +1003,12 @@ static void asl_ibecc_dev_realize(PCIDevice *d, Error **errp)
 {
     ASLIBECCState *s = ASL_IBECC_DEVICE(d);
 
+    if (s->machine_check) {
+        /* Expose an igen6_edac ID that selects a machine_check=true config. */
+        pci_set_word(d->config + PCI_DEVICE_ID, ASL_IBECC_MCE_DEVICE_ID);
+        pci_set_word(d->config + PCI_SUBSYSTEM_ID, ASL_IBECC_MCE_DEVICE_ID);
+    }
+
     if (s->proxy_to_mch) {
         if (!global_mch_asl_ibecc || !global_mch_asl_ibecc->x_asl_ibecc) {
             error_setg(errp,
@@ -1019,6 +1027,7 @@ static void asl_ibecc_dev_realize(PCIDevice *d, Error **errp)
 
 static const Property asl_ibecc_props[] = {
     DEFINE_PROP_BOOL("x-mch-proxy", ASLIBECCState, proxy_to_mch, false),
+    DEFINE_PROP_BOOL("x-machine-check", ASLIBECCState, machine_check, false),
 };
 
 static void asl_ibecc_class_init(ObjectClass *klass, const void *data)

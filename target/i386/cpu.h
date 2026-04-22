@@ -2408,6 +2408,11 @@ struct ArchCPU {
      */
     bool enable_lmce;
 
+    /* Testing knobs for external MCE injection semantics. */
+    bool mce_auto_broadcast;
+    bool mce_halt_wakeup;
+    bool mce_broadcast_notify;
+
     /* Compatibility bits for old machine types.
      * If true present virtual l3 cache for VM, the vcpus in the same virtual
      * socket share an virtual l3 cache.
@@ -2840,6 +2845,7 @@ void do_cpu_init(X86CPU *cpu);
 
 #define MCE_INJECT_BROADCAST    1
 #define MCE_INJECT_UNCOND_AO    2
+#define MCE_INJECT_BROADCAST_NOTIFY 4
 
 void cpu_x86_inject_mce(Monitor *mon, X86CPU *cpu, int bank,
                         uint64_t status, uint64_t mcg_status, uint64_t addr,

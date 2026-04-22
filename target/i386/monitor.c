@@ -30,6 +30,7 @@
 #include "qobject/qdict.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-misc.h"
+#include "hw/pci-host/q35.h"
 #include "system/memory.h"
 
 /* Perform linear address sign extension */
@@ -574,6 +575,7 @@ void hmp_mce(Monitor *mon, const QDict *qdict)
 {
     X86CPU *cpu;
     CPUState *cs;
+    CPUState *other_cs;
     int cpu_index = qdict_get_int(qdict, "cpu_index");
     int bank = qdict_get_int(qdict, "bank");
     uint64_t status = qdict_get_int(qdict, "status");
@@ -581,13 +583,34 @@ void hmp_mce(Monitor *mon, const QDict *qdict)
     uint64_t addr = qdict_get_int(qdict, "addr");
     uint64_t misc = qdict_get_int(qdict, "misc");
     int flags = MCE_INJECT_UNCOND_AO;
+    bool broadcast = qdict_get_try_bool(qdict, "broadcast", false);
+    bool have_other_cpu = false;
 
-    if (qdict_get_try_bool(qdict, "broadcast", false)) {
+    if (mcg_status == 0) {
+        mcg_status = MCG_STATUS_MCIP | MCG_STATUS_EIPV;
+        if (!(status & MCI_STATUS_PCC)) {
+            mcg_status |= MCG_STATUS_RIPV;
+        }
+    }
+
+    if (broadcast) {
         flags |= MCE_INJECT_BROADCAST;
     }
     cs = qemu_get_cpu(cpu_index);
     if (cs != NULL) {
         cpu = X86_CPU(cs);
+        CPU_FOREACH(other_cs) {
+            if (other_cs != cs) {
+                have_other_cpu = true;
+                break;
+            }
+        }
+        if (!broadcast && cpu->mce_auto_broadcast && have_other_cpu &&
+            !(mcg_status & MCG_STATUS_LMCE) &&
+            cpu_x86_support_mca_broadcast(&cpu->env)) {
+            flags |= MCE_INJECT_BROADCAST;
+        }
+        q35_asl_ibecc_inject_error(addr, !!(status & MCI_STATUS_UC));
         cpu_x86_inject_mce(mon, cpu, bank, status, mcg_status, addr, misc,
                            flags);
     }

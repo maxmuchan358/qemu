@@ -9398,6 +9398,11 @@ static void mce_init(X86CPU *cpu)
             (CPUID_MCE | CPUID_MCA)) {
         cenv->mcg_cap = MCE_CAP_DEF | MCE_BANKS_DEF |
                         (cpu->enable_lmce ? MCG_LMCE_P : 0);
+        if (cpu->enable_lmce) {
+            cenv->msr_ia32_feature_control |= FEATURE_CONTROL_LOCKED |
+                                              FEATURE_CONTROL_LMCE;
+            cenv->mcg_ext_ctl |= MCG_EXT_CTL_LMCE_EN;
+        }
         cenv->mcg_ctl = ~(uint64_t)0;
         for (bank = 0; bank < MCE_BANKS_DEF; bank++) {
             cenv->mce_banks[bank * 4] = ~(uint64_t)0;
@@ -10645,6 +10650,11 @@ static const Property x86_cpu_properties[] = {
     DEFINE_PROP_BOOL("x-vendor-cpuid-only-v2", X86CPU, vendor_cpuid_only_v2, true),
     DEFINE_PROP_BOOL("x-amd-topoext-features-only", X86CPU, amd_topoext_features_only, true),
     DEFINE_PROP_BOOL("lmce", X86CPU, enable_lmce, false),
+    DEFINE_PROP_BOOL("x-mce-auto-broadcast", X86CPU, mce_auto_broadcast,
+                     true),
+    DEFINE_PROP_BOOL("x-mce-halt-wakeup", X86CPU, mce_halt_wakeup, true),
+    DEFINE_PROP_BOOL("x-mce-broadcast-notify", X86CPU,
+                     mce_broadcast_notify, true),
     DEFINE_PROP_BOOL("l3-cache", X86CPU, enable_l3_cache, true),
     DEFINE_PROP_BOOL("kvm-pv-enforce-cpuid", X86CPU, kvm_pv_enforce_cpuid,
                      false),

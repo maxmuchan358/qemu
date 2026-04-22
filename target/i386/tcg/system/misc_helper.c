@@ -282,6 +282,23 @@ void helper_wrmsr(CPUX86State *env)
             env->mcg_ctl = val;
         }
         break;
+    case MSR_MCG_EXT_CTL:
+        if ((env->mcg_cap & MCG_LMCE_P) &&
+            !(val & ~MCG_EXT_CTL_LMCE_EN)) {
+            env->mcg_ext_ctl = val;
+        } else {
+            goto error;
+        }
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        if (env->msr_ia32_feature_control & FEATURE_CONTROL_LOCKED) {
+            if (val != env->msr_ia32_feature_control) {
+                goto error;
+            }
+        } else {
+            env->msr_ia32_feature_control = val;
+        }
+        break;
     case MSR_TSC_AUX:
         env->tsc_aux = val;
         break;
@@ -458,6 +475,12 @@ void helper_rdmsr(CPUX86State *env)
         break;
     case MSR_MCG_STATUS:
         val = env->mcg_status;
+        break;
+    case MSR_MCG_EXT_CTL:
+        val = env->mcg_ext_ctl;
+        break;
+    case MSR_IA32_FEATURE_CONTROL:
+        val = env->msr_ia32_feature_control;
         break;
     case MSR_IA32_MISC_ENABLE:
         val = env->msr_ia32_misc_enable;

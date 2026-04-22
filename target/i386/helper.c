@@ -403,6 +403,8 @@ static void do_inject_x86_mce(CPUState *cs, run_on_cpu_data data)
     uint64_t *banks = cenv->mce_banks + 4 * params->bank;
     g_autofree char *msg = NULL;
     bool need_reset = false;
+    bool notify_only = !!(params->flags & MCE_INJECT_BROADCAST_NOTIFY) &&
+                       cpu->mce_broadcast_notify;
     bool recursive;
     bool ar = !!(params->status & MCI_STATUS_AR);
 
@@ -415,6 +417,17 @@ static void do_inject_x86_mce(CPUState *cs, run_on_cpu_data data)
      */
     if (!(params->flags & MCE_INJECT_UNCOND_AO) && !ar && recursive) {
         emit_guest_memory_failure(MEMORY_FAILURE_ACTION_IGNORE, ar, recursive);
+        return;
+    }
+
+    if (notify_only) {
+        cenv->mcg_status = params->mcg_status;
+        if (cpu->mce_halt_wakeup && cs->halted) {
+            cs->halted = 0;
+            cs->exception_index = -1;
+        }
+        cpu_interrupt(cs, CPU_INTERRUPT_MCE);
+        emit_guest_memory_failure(MEMORY_FAILURE_ACTION_INJECT, ar, recursive);
         return;
     }
 
@@ -468,6 +481,10 @@ static void do_inject_x86_mce(CPUState *cs, run_on_cpu_data data)
         banks[3] = params->misc;
         cenv->mcg_status = params->mcg_status;
         banks[1] = params->status;
+        if (cpu->mce_halt_wakeup && cs->halted) {
+            cs->halted = 0;
+            cs->exception_index = -1;
+        }
         cpu_interrupt(cs, CPU_INTERRUPT_MCE);
     } else if (!(banks[1] & MCI_STATUS_VAL)
                || !(banks[1] & MCI_STATUS_UC)) {
@@ -524,10 +541,14 @@ void cpu_x86_inject_mce(Monitor *mon, X86CPU *cpu, int bank,
         CPUState *other_cs;
 
         params.bank = 1;
-        params.status = MCI_STATUS_VAL | MCI_STATUS_UC;
-        params.mcg_status = MCG_STATUS_MCIP | MCG_STATUS_RIPV;
+        params.status = cpu->mce_broadcast_notify ? 0
+                                                  : (MCI_STATUS_VAL | MCI_STATUS_UC);
+        params.mcg_status = MCG_STATUS_MCIP | MCG_STATUS_EIPV |
+                            MCG_STATUS_RIPV;
         params.addr = 0;
         params.misc = 0;
+        params.flags = cpu->mce_broadcast_notify ?
+            (flags | MCE_INJECT_BROADCAST_NOTIFY) : flags;
         CPU_FOREACH(other_cs) {
             if (other_cs == cs) {
                 continue;
