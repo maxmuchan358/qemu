@@ -25,6 +25,11 @@ config PCI_TESTDEV
     default y if TEST_DEVICES
     depends on PCI
 
+config CUSTOM_CRASHDUMP_TEST
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+
 config IOMMU_TESTDEV
     bool
     default y if TEST_DEVICES
