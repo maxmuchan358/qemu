@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci_device.h"
 #include "qemu/module.h"
 #include "qom/object.h"
@@ -49,10 +50,27 @@
 #define CUSTOM_MMIO_TABLE_BASEVAL   0x13570000U
 #define CUSTOM_QUEUE_BASEVAL        0x24680000U
 
+#define CUSTOM_PROFILE_GENERIC      0U
+
+typedef struct CustomPatternConfig {
+    uint32_t cfg40_value;
+    uint32_t mmio_value;
+    uint32_t ioport_value;
+    uint32_t cfg_pattern_base;
+    uint32_t mmio_pattern_base;
+    uint32_t pio_pattern_base;
+    uint32_t mmio_index_base;
+    uint32_t pio_index_base;
+    uint32_t mmio_table_base;
+    uint32_t queue_base;
+} CustomPatternConfig;
+
 typedef struct CustomCrashdumpTestState {
     PCIDevice parent_obj;
     MemoryRegion mmio;
     MemoryRegion pio;
+    uint32_t profile;
+    uint32_t instance_id;
     uint32_t mmio_regs[CUSTOM_MMIO_REG_COUNT];
     uint32_t pio_regs[CUSTOM_PIO_REG_COUNT];
     uint32_t mmio_indexed[CUSTOM_MMIO_INDEX_COUNT];
@@ -65,41 +83,70 @@ typedef struct CustomCrashdumpTestState {
 
 OBJECT_DECLARE_SIMPLE_TYPE(CustomCrashdumpTestState, CUSTOM_CRASHDUMP_TEST)
 
+static const Property custom_crashdump_properties[] = {
+    DEFINE_PROP_UINT32("profile", CustomCrashdumpTestState, profile,
+                       CUSTOM_PROFILE_GENERIC),
+    DEFINE_PROP_UINT32("instance-id", CustomCrashdumpTestState, instance_id, 0),
+};
+
+static CustomPatternConfig custom_pattern_config(const CustomCrashdumpTestState *s)
+{
+    uint32_t profile_offset = s->profile << 16;
+    uint32_t instance_offset = s->instance_id << 8;
+
+    return (CustomPatternConfig) {
+        .cfg40_value = CUSTOM_CFG40_VALUE + profile_offset + instance_offset,
+        .mmio_value = CUSTOM_MMIO_VALUE + profile_offset + instance_offset,
+        .ioport_value = CUSTOM_IOPORT_VALUE + profile_offset + instance_offset,
+        .cfg_pattern_base = CUSTOM_CFG_PATTERN_BASE + profile_offset + instance_offset,
+        .mmio_pattern_base = CUSTOM_MMIO_PATTERN_BASE + profile_offset + instance_offset,
+        .pio_pattern_base = CUSTOM_PIO_PATTERN_BASE + profile_offset + instance_offset,
+        .mmio_index_base = CUSTOM_MMIO_INDEX_BASE + profile_offset + instance_offset,
+        .pio_index_base = CUSTOM_PIO_INDEX_BASE + profile_offset + instance_offset,
+        .mmio_table_base = CUSTOM_MMIO_TABLE_BASEVAL + profile_offset + instance_offset,
+        .queue_base = CUSTOM_QUEUE_BASEVAL + profile_offset + instance_offset,
+    };
+}
+
 static void custom_crashdump_init_patterns(CustomCrashdumpTestState *s,
                                            PCIDevice *pdev)
 {
     unsigned int index;
+    CustomPatternConfig cfg = custom_pattern_config(s);
 
     for (index = 0; index < CUSTOM_MMIO_REG_COUNT; index++) {
-        s->mmio_regs[index] = CUSTOM_MMIO_PATTERN_BASE + (index * 0x111U);
+        s->mmio_regs[index] = cfg.mmio_pattern_base + (index * 0x111U);
     }
-    s->mmio_regs[0] = CUSTOM_MMIO_VALUE;
+    s->mmio_regs[0] = cfg.mmio_value;
 
     for (index = 0; index < CUSTOM_PIO_REG_COUNT; index++) {
-        s->pio_regs[index] = CUSTOM_PIO_PATTERN_BASE + (index * 0x101U);
+        s->pio_regs[index] = cfg.pio_pattern_base + (index * 0x101U);
     }
-    s->pio_regs[0] = CUSTOM_IOPORT_VALUE;
+    s->pio_regs[0] = cfg.ioport_value;
 
     for (index = 0; index < CUSTOM_MMIO_INDEX_COUNT; index++) {
-        s->mmio_indexed[index] = CUSTOM_MMIO_INDEX_BASE + (index * 0x21U);
+        s->mmio_indexed[index] = cfg.mmio_index_base + (index * 0x21U);
     }
 
     for (index = 0; index < CUSTOM_PIO_INDEX_COUNT; index++) {
-        s->pio_indexed[index] = CUSTOM_PIO_INDEX_BASE + (index * 0x31U);
+        s->pio_indexed[index] = cfg.pio_index_base + (index * 0x31U);
     }
 
     for (index = 0; index < CUSTOM_MMIO_TABLE_COUNT; index++) {
-        s->mmio_table[index] = CUSTOM_MMIO_TABLE_BASEVAL + (index * 0x41U);
+        s->mmio_table[index] = cfg.mmio_table_base + (index * 0x41U);
     }
 
     for (index = 0; index < CUSTOM_QUEUE_REG_COUNT; index++) {
-        s->queue_regs[index] = CUSTOM_QUEUE_BASEVAL + (index * 0x51U);
+        s->queue_regs[index] = cfg.queue_base + (index * 0x51U);
     }
 
     for (index = 0x40; index < 0x100; index += sizeof(uint32_t)) {
-        pci_set_long(&pdev->config[index], CUSTOM_CFG_PATTERN_BASE + index);
+        pci_set_long(&pdev->config[index], cfg.cfg_pattern_base + index);
     }
-    pci_set_long(&pdev->config[0x40], CUSTOM_CFG40_VALUE);
+    pci_set_long(&pdev->config[0x40], cfg.cfg40_value);
+    pci_set_long(&pdev->config[0x44], s->profile);
+    pci_set_long(&pdev->config[0x48], s->instance_id);
+    pci_set_long(&pdev->config[0x4c], (s->profile << 16) | (s->instance_id & 0xffffU));
 }
 
 static uint64_t custom_mmio_read(void *opaque, hwaddr addr, unsigned size)
@@ -287,6 +334,7 @@ static void custom_crashdump_class_init(ObjectClass *klass, const void *data)
     k->class_id = PCI_CLASS_OTHERS;
     
     dc->desc = "Custom crashdump register test device";
+    device_class_set_props(dc, custom_crashdump_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
