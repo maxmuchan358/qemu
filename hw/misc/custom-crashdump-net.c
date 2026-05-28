@@ -1,15 +1,8 @@
 /*
- * QEMU custom crashdump NIC diagnostic device
+ * QEMU custom crashdump NIC verification device
  *
- * Simulates a NIC-style register surface for crashdump validation:
- * - MAC address registers
- * - Link status and PHY state
- * - Rx/Tx statistics counters
- * - Error counters
- * - Indirect index/data register pair (MMIO)
- * - I/O port command/status/DMA registers (BAR1)
- *
- * vendor=0x1d5f  device=0xd001
+ * Returns deterministic bytes for the PCI config, MMIO, and PIO regions that
+ * the kdump tables dump for the custom net device.
  */
 
 #include "qemu/osdep.h"
@@ -23,276 +16,179 @@
 #define CUSTOM_NET_VENDOR_ID    0x1d5f
 #define CUSTOM_NET_DEVICE_ID    0xd001
 
-/* MMIO register offsets (BAR0, 512 bytes) */
-#define NET_MMIO_MAC_LO         0x000
-#define NET_MMIO_MAC_HI         0x004
-#define NET_MMIO_LINK_STATUS    0x008
-#define NET_MMIO_INT_STATUS     0x00c
-#define NET_MMIO_RX_GOOD_LO     0x010
-#define NET_MMIO_RX_GOOD_HI     0x014
-#define NET_MMIO_RX_BYTES_LO    0x018
-#define NET_MMIO_RX_BYTES_HI    0x01c
-#define NET_MMIO_RX_ERRORS      0x020
-#define NET_MMIO_RX_DROPS       0x024
-#define NET_MMIO_RX_OVERRUNS    0x028
-#define NET_MMIO_RX_FIFO_ERR    0x02c
-#define NET_MMIO_TX_GOOD_LO     0x030
-#define NET_MMIO_TX_GOOD_HI     0x034
-#define NET_MMIO_TX_BYTES_LO    0x038
-#define NET_MMIO_TX_BYTES_HI    0x03c
-#define NET_MMIO_TX_ERRORS      0x040
-#define NET_MMIO_TX_DROPS       0x044
-#define NET_MMIO_TX_RETRIES     0x048
-#define NET_MMIO_TX_COLLISION   0x04c
-#define NET_MMIO_ERR_CRC        0x050
-#define NET_MMIO_ERR_FRAME      0x054
-#define NET_MMIO_ERR_OVERFLOW   0x058
-#define NET_MMIO_ERR_UNDERFLOW  0x05c
-#define NET_MMIO_CTRL           0x060
-#define NET_MMIO_FW_VERSION     0x064
-#define NET_MMIO_PHY_ID         0x068
-#define NET_MMIO_PHY_STATUS     0x06c
-#define NET_MMIO_IDX_SEL        0x100
-#define NET_MMIO_IDX_DATA       0x104
+#define CUSTOM_NET_MMIO_SIZE 0x200
+#define CUSTOM_NET_PIO_SIZE  0x40
 
-#define NET_MMIO_DIRECT_COUNT   28   /* dwords 0x000-0x06c */
-#define NET_IDX_COUNT           8
-#define NET_MMIO_SIZE           0x200
-#define NET_PIO_SIZE            0x40
-#define NET_PIO_COUNT           16
-
-/* link_status bit definitions */
-#define NET_LINK_SPEED_1G       1000
-#define NET_LINK_UP             (1u << 16)
-#define NET_LINK_FULL_DUPLEX    (1u << 17)
-
-/* ctrl bit definitions */
-#define NET_CTRL_ENABLE         (1u << 0)
-#define NET_CTRL_PROMISC        (1u << 1)
-#define NET_CTRL_LOOPBACK       (1u << 2)
+#define CUSTOM_NET_CFG_OFFSET 0x40
+#define CUSTOM_NET_CFG_SIZE   (PCI_CONFIG_SPACE_SIZE - CUSTOM_NET_CFG_OFFSET)
 
 typedef struct CustomNetDiagState {
     PCIDevice parent_obj;
     MemoryRegion mmio;
     MemoryRegion pio;
     uint32_t instance_id;
-
-    /* Direct MMIO registers (0x000-0x06c) */
-    uint32_t mac_lo;
-    uint32_t mac_hi;
-    uint32_t link_status;
-    uint32_t int_status;
-    uint32_t rx_good_lo;
-    uint32_t rx_good_hi;
-    uint32_t rx_bytes_lo;
-    uint32_t rx_bytes_hi;
-    uint32_t rx_errors;
-    uint32_t rx_drops;
-    uint32_t rx_overruns;
-    uint32_t rx_fifo_err;
-    uint32_t tx_good_lo;
-    uint32_t tx_good_hi;
-    uint32_t tx_bytes_lo;
-    uint32_t tx_bytes_hi;
-    uint32_t tx_errors;
-    uint32_t tx_drops;
-    uint32_t tx_retries;
-    uint32_t tx_collision;
-    uint32_t err_crc;
-    uint32_t err_frame;
-    uint32_t err_overflow;
-    uint32_t err_underflow;
-    uint32_t ctrl;
-    uint32_t fw_version;
-    uint32_t phy_id;
-    uint32_t phy_status;
-
-    /* Indirect registers (accessed via IDX_SEL/IDX_DATA at 0x100/0x104) */
-    uint32_t idx_sel;
-    uint32_t idx_data[NET_IDX_COUNT];
-
-    /* PIO registers (BAR1, 64 bytes) */
-    uint32_t pio_regs[NET_PIO_COUNT];
+    uint8_t mmio_data[CUSTOM_NET_MMIO_SIZE];
+    uint8_t pio_data[CUSTOM_NET_PIO_SIZE];
 } CustomNetDiagState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(CustomNetDiagState, CUSTOM_NET_DIAG)
+
+static uint32_t kdmp_pattern_signature(char device_tag, char space_tag,
+                                       uint32_t salt)
+{
+    return 0x4b44554dU ^ ((uint32_t)(uint8_t)device_tag << 24)
+           ^ ((uint32_t)(uint8_t)space_tag << 16) ^ salt;
+}
+
+static uint8_t kdmp_pattern_byte(char device_tag, char space_tag,
+                                 uint32_t variant, uint32_t salt,
+                                 uint32_t offset)
+{
+    if (offset == 0) {
+        return 'K';
+    }
+    if (offset == 1) {
+        return 'D';
+    }
+    if (offset == 2) {
+        return 'M';
+    }
+    if (offset == 3) {
+        return 'P';
+    }
+    if (offset == 4) {
+        return (uint8_t)device_tag;
+    }
+    if (offset == 5) {
+        return (uint8_t)space_tag;
+    }
+    if (offset == 6) {
+        return variant & 0xff;
+    }
+    if (offset == 7) {
+        return (variant >> 8) & 0xff;
+    }
+
+    return (uint8_t)(((offset * 0x3dU) ^ (offset >> 8)
+                      ^ (uint8_t)device_tag ^ ((uint8_t)space_tag << 1)
+                      ^ variant ^ salt) & 0xff);
+}
 
 static const Property custom_net_properties[] = {
     DEFINE_PROP_UINT32("instance-id", CustomNetDiagState, instance_id, 0),
 };
 
-static void custom_net_init_patterns(CustomNetDiagState *s, PCIDevice *pdev)
+static void kdmp_fill_region(uint8_t *buf, size_t len, char device_tag,
+                             char space_tag, uint32_t variant, uint32_t salt)
 {
-    uint32_t id = s->instance_id;
-    unsigned int i;
+    size_t offset;
 
-    /* MAC: locally administered, instance-specific */
-    s->mac_lo        = 0xAABBCC00u | (id & 0xff);
-    s->mac_hi        = 0x0000DD00u | ((id >> 8) & 0xff);
-    s->link_status   = NET_LINK_UP | NET_LINK_FULL_DUPLEX | NET_LINK_SPEED_1G;
-    s->int_status    = 0x00000000u;
+    memset(buf, 0, len);
+    for (offset = 0; offset < len; offset++) {
+        buf[offset] = kdmp_pattern_byte(device_tag, space_tag,
+                                        variant, salt, offset);
+    }
 
-    /* Simulated packet counts - distinctive patterns */
-    s->rx_good_lo    = 0xC0010000u | id;
-    s->rx_good_hi    = 0x00000000u;
-    s->rx_bytes_lo   = 0xC0020000u | id;
-    s->rx_bytes_hi   = 0x00000001u;
-    s->rx_errors     = 0x00000000u;
-    s->rx_drops      = 0x00000000u;
-    s->rx_overruns   = 0x00000000u;
-    s->rx_fifo_err   = 0x00000000u;
-    s->tx_good_lo    = 0xC0030000u | id;
-    s->tx_good_hi    = 0x00000000u;
-    s->tx_bytes_lo   = 0xC0040000u | id;
-    s->tx_bytes_hi   = 0x00000000u;
-    s->tx_errors     = 0x00000000u;
-    s->tx_drops      = 0x00000000u;
-    s->tx_retries    = 0x00000000u;
-    s->tx_collision  = 0x00000000u;
-    s->err_crc       = 0x00000000u;
-    s->err_frame     = 0x00000000u;
-    s->err_overflow  = 0x00000000u;
-    s->err_underflow = 0x00000000u;
-    s->ctrl          = NET_CTRL_ENABLE;
-    s->fw_version    = 0x01020300u | (id & 0xff);   /* v1.2.3.id */
-    s->phy_id        = 0xBCBC0000u | id;
-    s->phy_status    = 0x00000314u;  /* link ok, full-duplex, 1G */
-
-    s->idx_sel = 0;
-    for (i = 0; i < NET_IDX_COUNT; i++)
-        s->idx_data[i] = 0xDDDD0000u | (i << 8) | (id & 0xff);
-
-    /* PIO: cmd=idle, status=ready, rest are diagnostic patterns */
-    s->pio_regs[0] = 0x00000000u;           /* cmd: idle */
-    s->pio_regs[1] = 0x00000001u;           /* status: ready */
-    s->pio_regs[2] = 0x00000000u;           /* dma_lo */
-    s->pio_regs[3] = 0x00000000u;           /* dma_hi */
-    s->pio_regs[4] = 0x00000000u;           /* desc_head */
-    s->pio_regs[5] = 0x00000000u;           /* desc_tail */
-    for (i = 6; i < NET_PIO_COUNT; i++)
-        s->pio_regs[i] = 0xF00D0000u | (i << 8) | (id & 0xff);
-
-    /* PCI config space: write diagnostic pattern at offset 0x40+ */
-    pci_set_long(&pdev->config[0x40], 0xD0010000u | id);
-    pci_set_long(&pdev->config[0x44], CUSTOM_NET_VENDOR_ID | (CUSTOM_NET_DEVICE_ID << 16));
-    pci_set_long(&pdev->config[0x48], id);
+    if (len >= 12) {
+        stl_le_p(buf + 8, len);
+    }
+    if (len >= 16) {
+        stl_le_p(buf + 12, kdmp_pattern_signature(device_tag, space_tag,
+                                                 salt));
+    }
 }
 
-static uint32_t *custom_net_mmio_reg(CustomNetDiagState *s, hwaddr addr)
+static uint64_t kdmp_region_read(const uint8_t *buf, size_t len,
+                                 hwaddr addr, unsigned size)
 {
-    switch (addr) {
-    case NET_MMIO_MAC_LO:        return &s->mac_lo;
-    case NET_MMIO_MAC_HI:        return &s->mac_hi;
-    case NET_MMIO_LINK_STATUS:   return &s->link_status;
-    case NET_MMIO_INT_STATUS:    return &s->int_status;
-    case NET_MMIO_RX_GOOD_LO:    return &s->rx_good_lo;
-    case NET_MMIO_RX_GOOD_HI:    return &s->rx_good_hi;
-    case NET_MMIO_RX_BYTES_LO:   return &s->rx_bytes_lo;
-    case NET_MMIO_RX_BYTES_HI:   return &s->rx_bytes_hi;
-    case NET_MMIO_RX_ERRORS:     return &s->rx_errors;
-    case NET_MMIO_RX_DROPS:      return &s->rx_drops;
-    case NET_MMIO_RX_OVERRUNS:   return &s->rx_overruns;
-    case NET_MMIO_RX_FIFO_ERR:   return &s->rx_fifo_err;
-    case NET_MMIO_TX_GOOD_LO:    return &s->tx_good_lo;
-    case NET_MMIO_TX_GOOD_HI:    return &s->tx_good_hi;
-    case NET_MMIO_TX_BYTES_LO:   return &s->tx_bytes_lo;
-    case NET_MMIO_TX_BYTES_HI:   return &s->tx_bytes_hi;
-    case NET_MMIO_TX_ERRORS:     return &s->tx_errors;
-    case NET_MMIO_TX_DROPS:      return &s->tx_drops;
-    case NET_MMIO_TX_RETRIES:    return &s->tx_retries;
-    case NET_MMIO_TX_COLLISION:  return &s->tx_collision;
-    case NET_MMIO_ERR_CRC:       return &s->err_crc;
-    case NET_MMIO_ERR_FRAME:     return &s->err_frame;
-    case NET_MMIO_ERR_OVERFLOW:  return &s->err_overflow;
-    case NET_MMIO_ERR_UNDERFLOW: return &s->err_underflow;
-    case NET_MMIO_CTRL:          return &s->ctrl;
-    case NET_MMIO_FW_VERSION:    return &s->fw_version;
-    case NET_MMIO_PHY_ID:        return &s->phy_id;
-    case NET_MMIO_PHY_STATUS:    return &s->phy_status;
-    case NET_MMIO_IDX_SEL:       return &s->idx_sel;
-    default:                     return NULL;
+    uint64_t value = 0;
+    unsigned int index;
+
+    if (size != 1 && size != 2 && size != 4) {
+        return UINT64_MAX;
     }
+    if (addr > len || size > len - addr) {
+        return UINT64_MAX;
+    }
+
+    for (index = 0; index < size; index++) {
+        value |= (uint64_t)buf[addr + index] << (index * 8);
+    }
+
+    return value;
+}
+
+static void kdmp_region_write(uint8_t *buf, size_t len, hwaddr addr,
+                              uint64_t value, unsigned size)
+{
+    unsigned int index;
+
+    if (size != 1 && size != 2 && size != 4) {
+        return;
+    }
+    if (addr > len || size > len - addr) {
+        return;
+    }
+
+    for (index = 0; index < size; index++) {
+        buf[addr + index] = (value >> (index * 8)) & 0xff;
+    }
+}
+
+static void custom_net_init_patterns(CustomNetDiagState *s, PCIDevice *pdev)
+{
+    kdmp_fill_region(&pdev->config[CUSTOM_NET_CFG_OFFSET], CUSTOM_NET_CFG_SIZE,
+                     'N', 'C', s->instance_id, 0);
+    kdmp_fill_region(s->mmio_data, sizeof(s->mmio_data), 'N', 'M',
+                     s->instance_id, 0);
+    kdmp_fill_region(s->pio_data, sizeof(s->pio_data), 'N', 'P',
+                     s->instance_id, 0);
 }
 
 static uint64_t custom_net_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     CustomNetDiagState *s = opaque;
-    uint32_t *reg;
 
-    if (size != 4)
-        return 0xffffffff;
-
-    if (addr == NET_MMIO_IDX_DATA)
-        return s->idx_data[s->idx_sel % NET_IDX_COUNT];
-
-    reg = custom_net_mmio_reg(s, addr);
-    return reg ? *reg : 0xffffffff;
+    return kdmp_region_read(s->mmio_data, sizeof(s->mmio_data), addr, size);
 }
 
-static void custom_net_mmio_write(void *opaque, hwaddr addr, uint64_t val,
+static void custom_net_mmio_write(void *opaque, hwaddr addr, uint64_t value,
                                   unsigned size)
 {
     CustomNetDiagState *s = opaque;
-    uint32_t *reg;
 
-    if (size != 4)
-        return;
-
-    if (addr == NET_MMIO_IDX_DATA) {
-        s->idx_data[s->idx_sel % NET_IDX_COUNT] = (uint32_t)val;
-        return;
-    }
-
-    reg = custom_net_mmio_reg(s, addr);
-    if (reg)
-        *reg = (uint32_t)val;
+    kdmp_region_write(s->mmio_data, sizeof(s->mmio_data), addr, value, size);
 }
 
 static uint64_t custom_net_pio_read(void *opaque, hwaddr addr, unsigned size)
 {
     CustomNetDiagState *s = opaque;
-    unsigned int index;
 
-    if (size != 4)
-        return 0xffffffff;
-
-    if (addr < NET_PIO_SIZE) {
-        index = addr >> 2;
-        return s->pio_regs[index];
-    }
-
-    return 0xffffffff;
+    return kdmp_region_read(s->pio_data, sizeof(s->pio_data), addr, size);
 }
 
-static void custom_net_pio_write(void *opaque, hwaddr addr, uint64_t val,
+static void custom_net_pio_write(void *opaque, hwaddr addr, uint64_t value,
                                  unsigned size)
 {
     CustomNetDiagState *s = opaque;
-    unsigned int index;
 
-    if (size != 4)
-        return;
-
-    if (addr < NET_PIO_SIZE) {
-        index = addr >> 2;
-        s->pio_regs[index] = (uint32_t)val;
-    }
+    kdmp_region_write(s->pio_data, sizeof(s->pio_data), addr, value, size);
 }
 
 static const MemoryRegionOps custom_net_mmio_ops = {
     .read = custom_net_mmio_read,
     .write = custom_net_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
-    .impl  = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
+    .impl  = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
 };
 
 static const MemoryRegionOps custom_net_pio_ops = {
     .read = custom_net_pio_read,
     .write = custom_net_pio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
-    .impl  = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
+    .impl  = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
 };
 
 static void custom_net_realize(PCIDevice *pdev, Error **errp)
@@ -303,9 +199,9 @@ static void custom_net_realize(PCIDevice *pdev, Error **errp)
     custom_net_init_patterns(s, pdev);
 
     memory_region_init_io(&s->mmio, OBJECT(s), &custom_net_mmio_ops, s,
-                          "custom-net-mmio", NET_MMIO_SIZE);
+                          "custom-net-mmio", CUSTOM_NET_MMIO_SIZE);
     memory_region_init_io(&s->pio, OBJECT(s), &custom_net_pio_ops, s,
-                          "custom-net-pio", NET_PIO_SIZE);
+                          "custom-net-pio", CUSTOM_NET_PIO_SIZE);
 
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     pci_register_bar(pdev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->pio);

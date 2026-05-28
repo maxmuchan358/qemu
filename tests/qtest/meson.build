@@ -53,6 +53,10 @@ qtests_filter = \
 qtests_i386 = \
   (slirp.found() ? ['pxe-test'] : []) + \
   qtests_filter + \
+  (config_all_devices.has_key('CONFIG_CUSTOM_CRASHDUMP_TEST') and          \
+   config_all_devices.has_key('CONFIG_CUSTOM_CRASHDUMP_NET') and           \
+   config_all_devices.has_key('CONFIG_CUSTOM_CRASHDUMP_STOR') and          \
+   config_all_devices.has_key('CONFIG_Q35') ? ['custom-crashdump-qtest'] : []) + \
   (config_all_devices.has_key('CONFIG_ACPI_VMGENID') ? ['vmgenid-test'] : []) +             \
   (config_all_devices.has_key('CONFIG_AHCI_ICH9') and have_tools ? ['ahci-test'] : []) +    \
   (config_all_devices.has_key('CONFIG_AHCI_ICH9') ? ['tco-test'] : []) +                    \
