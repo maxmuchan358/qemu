@@ -9,12 +9,15 @@
 #include "libqtest.h"
 #include "libqos/pci.h"
 #include "libqos/pci-pc.h"
+#include "standard-headers/linux/pci_regs.h"
 
 #define TEST_CMDLINE \
     "-M q35 -nodefaults " \
     "-device custom-crashdump-test,addr=04.0,profile=1,instance-id=42 " \
     "-device custom-crashdump-net,addr=05.0,instance-id=1 " \
-    "-device custom-crashdump-stor,addr=06.0,instance-id=2"
+    "-device custom-crashdump-stor,addr=06.0,instance-id=2 " \
+    "-device pcie-root-port,id=crash_rp0,bus=pcie.0,chassis=7,slot=7,addr=07.0 " \
+    "-device custom-crashdump-pcie,bus=crash_rp0,addr=00.0,instance-id=3"
 
 typedef struct PatternSpec {
     char device_tag;
@@ -218,12 +221,43 @@ static void test_custom_stor_device(void)
     qtest_quit(qts);
 }
 
+static void test_custom_pcie_device(void)
+{
+    QTestState *qts;
+    QPCIBus *pcibus;
+    QPCIDevice *dev;
+    uint8_t cap_ptr;
+    uint32_t bar0;
+
+    qts = qtest_init(TEST_CMDLINE);
+    pcibus = qpci_new_pc(qts, NULL);
+    g_assert_cmpint(qpci_secondary_buses_init(pcibus), >=, 1);
+    dev = qpci_device_find(pcibus, QPCI_DEVFN(0x20, 0x0));
+    g_assert_nonnull(dev);
+
+    qpci_device_enable(dev);
+
+    cap_ptr = qpci_config_readb(dev, PCI_CAPABILITY_LIST);
+    g_assert_cmphex(cap_ptr, ==, 0x80);
+    g_assert_cmphex(qpci_config_readb(dev, cap_ptr + PCI_CAP_LIST_ID), ==,
+                    PCI_CAP_ID_EXP);
+
+    bar0 = qpci_config_readl(dev, PCI_BASE_ADDRESS_0);
+    g_assert_cmphex(bar0 & PCI_BASE_ADDRESS_MEM_TYPE_MASK, ==,
+                    PCI_BASE_ADDRESS_MEM_TYPE_64);
+
+    g_free(dev);
+    qpci_free_pc(pcibus);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/custom-crashdump/test-device", test_custom_test_device);
     qtest_add_func("/custom-crashdump/net-device", test_custom_net_device);
     qtest_add_func("/custom-crashdump/stor-device", test_custom_stor_device);
+    qtest_add_func("/custom-crashdump/pcie-device", test_custom_pcie_device);
 
     return g_test_run();
 }
