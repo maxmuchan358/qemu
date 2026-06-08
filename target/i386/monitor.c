@@ -30,6 +30,7 @@
 #include "qobject/qdict.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-misc.h"
+#include "hw/pci-host/q35.h"
 #include "system/memory.h"
 
 /* Perform linear address sign extension */
@@ -582,12 +583,20 @@ void hmp_mce(Monitor *mon, const QDict *qdict)
     uint64_t misc = qdict_get_int(qdict, "misc");
     int flags = MCE_INJECT_UNCOND_AO;
 
+    if (mcg_status == 0) {
+        mcg_status = MCG_STATUS_MCIP | MCG_STATUS_EIPV;
+        if (!(status & MCI_STATUS_PCC)) {
+            mcg_status |= MCG_STATUS_RIPV;
+        }
+    }
+
     if (qdict_get_try_bool(qdict, "broadcast", false)) {
         flags |= MCE_INJECT_BROADCAST;
     }
     cs = qemu_get_cpu(cpu_index);
     if (cs != NULL) {
         cpu = X86_CPU(cs);
+        q35_asl_ibecc_inject_error(addr, !!(status & MCI_STATUS_UC));
         cpu_x86_inject_mce(mon, cpu, bank, status, mcg_status, addr, misc,
                            flags);
     }
